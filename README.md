@@ -114,6 +114,7 @@ users. Configure each deployment with its own values, never shared with other pr
 | `CONSOLE_SESSION_SECRET` | from `python ui/backend/auth.py secret` |
 | `CONSOLE_PROJECT` | project name, e.g. `credit-risk`; bound into the session and the cookie name |
 | `CONSOLE_SESSION_HOURS` | session lifetime, default 12 |
+| `RAILWAY_DOCKERFILE_PATH` | `ui/Dockerfile` (otherwise Railway may build the training image in the root `Dockerfile`) |
 
 Sessions are signed with the deployment's secret and bound to its project, and the cookie is
 host-only, so a session from one project's console is never sent to, or accepted by, another.
