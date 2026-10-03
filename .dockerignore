@@ -6,3 +6,7 @@ __pycache__
 *.pyc
 .venv
 data
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.pytest_cache
