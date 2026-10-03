@@ -1,0 +1,2 @@
+moto[s3,dynamodb,sagemaker,ecr,ssm,events,sts]>=5.0,<6
+pytest>=7.4.0,<9

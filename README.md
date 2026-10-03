@@ -26,12 +26,29 @@ holds the model, its configuration and the train workflow.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 git clone --branch feature/v7-alignment https://github.com/Debashis2007/ML-Platform.git .platform
-pip install -r .platform/requirements.txt -r requirements.txt
+pip install -r .platform/requirements.txt -r requirements.txt -r requirements-dev.txt
 export PYTHONPATH=$PWD/.platform
 
-python -m pytest tests/ -q                                  # local lifecycle smoke test
+python -m pytest tests/ -q                                  # all tests, including mocked-AWS lifecycle
 python -m ml_platform.build_pipeline --config model.yaml    # pipeline definition, no AWS calls
+python scripts/local_e2e.py                                 # full v7 lifecycle against mocked AWS
 ```
+
+### Full lifecycle against mocked AWS
+
+`scripts/local_e2e.py` runs the v7 flow end to end with [moto](https://github.com/getmoto/moto)
+mocking S3, DynamoDB, SageMaker (pipeline execution and model registry), ECR, SSM and
+EventBridge. Fake credentials are forced, so it never touches a real account.
+
+| Stage | Real code | Mocked |
+|-------|-----------|--------|
+| Image push | — | ECR repository and digest |
+| Pipeline | `train.py`, `evaluate.py`, threshold gate, platform `publish_candidate.py` run locally | SageMaker pipeline execution and parameters, S3 staging |
+| Registration | Platform `register_candidate` Lambda (checksum copy-in, evidence, `PendingManualApproval`) | S3, DynamoDB, model registry |
+| Approval | Platform `approval_api` Lambda: self-approval refused (403), wrong hash refused (409), senior DS approval (200) | Okta claims passed as authorizer context |
+| Capture | Platform `capture_approval_event` Lambda: API approval confirmed and deploy parameter set; console approval flagged as violation | SSM, EventBridge |
+
+Promotion to Prod and endpoint releases are not part of the local run.
 
 ## Lifecycle
 

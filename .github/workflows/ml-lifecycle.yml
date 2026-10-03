@@ -30,8 +30,8 @@ jobs:
       - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.11"
-      - run: pip install -r .platform/requirements.txt -r requirements.txt
-      - name: Unit and local smoke tests
+      - run: pip install -r .platform/requirements.txt -r requirements.txt -r requirements-dev.txt
+      - name: Unit, local smoke and mocked-AWS lifecycle tests
         run: python -m pytest tests/ -q
       - name: Validate model.yaml
         run: python -c "from ml_platform.config import ModelConfig; print(ModelConfig.load('model.yaml').tags())"
