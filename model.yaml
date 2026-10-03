@@ -1,0 +1,58 @@
+# credit-risk POC — model configuration (ML Platform design v7 schema).
+# Training runs in the control plane NonProd account (aws.training_target:
+# control_plane), a POC deviation. The v7 target state is training_target: bu with the
+# BU account and per-BU member role; only the aws block changes.
+model:
+  id: credit-risk
+  tenant_id: demo
+  bu: demo
+  type: bu_specific
+  project: credit-risk
+  platform_version: v1.0.0
+
+aws:
+  training_target: control_plane
+  account_id: "848973819860"
+  region: us-east-1
+  pipeline_role_arn: arn:aws:iam::848973819860:role/mlp-sagemaker-pipeline
+  prod:                       # Prod retrain after promotion by digest (control plane Prod account)
+    account_id: "762794225431"
+    pipeline_role_arn: arn:aws:iam::762794225431:role/mlp-sagemaker-pipeline
+    train_uri: s3://mlp-prod-model-data/credit-risk/train/
+
+data:
+  train_uri: s3://ml-platform-data-848973819860/credit-risk/train/
+  target_column: default
+
+steps:
+  prepare:
+    enabled: false
+  train:
+    enabled: true
+    instance: ml.m5.xlarge
+    max_runtime: 2h
+    framework_version: "1.2-1"
+  evaluate:
+    enabled: true
+    instance: ml.m5.xlarge
+
+evaluation:
+  metrics: [auc, accuracy]
+  thresholds:
+    auc: 0.75
+
+registry:
+  model_package_group: ModelCreditRisk
+
+serving:
+  contract_version: "1.0"
+  instance: ml.m5.large
+  instance_count: 2
+
+deployment:
+  targets:
+    - { account: bu-nonprod, account_id: "546386837851", environment: qa, instance_count: 1 }
+    - { account: bu-prod, account_id: "259822548263", environment: live, instance_count: 2 }
+
+approvers:
+  - senior.datascientist@example.com   # replace with the senior data scientist(s) in the identity table

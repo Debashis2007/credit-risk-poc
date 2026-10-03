@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+
+# Platform checkout used by CI and local runs
+.platform
+
+# Local data and model artefacts
+data/
+output/
+*.joblib
+*.pkl
+*.tar.gz

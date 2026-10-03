@@ -1,0 +1,85 @@
+name: ML lifecycle — train (design v7)
+
+# Model repo workflow. Approval happens through the management API; promotion and
+# releases run from the platform repository's ml-lifecycle workflow.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  MLP_PLATFORM_REPOSITORY: ${{ vars.MLP_PLATFORM_REPOSITORY || 'Debashis2007/ML-Platform' }}
+  MLP_PLATFORM_REF: ${{ vars.MLP_PLATFORM_REF || 'feature/v7-alignment' }}
+  PYTHONPATH: ${{ github.workspace }}/.platform
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout platform (ml_platform package)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.MLP_PLATFORM_REPOSITORY }}
+          ref: ${{ env.MLP_PLATFORM_REF }}
+          path: .platform
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.11"
+      - run: pip install -r .platform/requirements.txt -r requirements.txt
+      - name: Unit and local smoke tests
+        run: python -m pytest tests/ -q
+      - name: Validate model.yaml
+        run: python -c "from ml_platform.config import ModelConfig; print(ModelConfig.load('model.yaml').tags())"
+      - name: Build pipeline definition
+        run: python -m ml_platform.build_pipeline --config model.yaml
+
+  train:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ml-nonprod
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout platform (ml_platform package)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.MLP_PLATFORM_REPOSITORY }}
+          ref: ${{ env.MLP_PLATFORM_REF }}
+          path: .platform
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.11"
+      - run: pip install -r .platform/requirements.txt -r requirements.txt
+      - uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
+        with:
+          role-to-assume: ${{ secrets.MLP_GHA_PIPELINE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+      - name: Build, push and pin image by digest
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          MODEL_ID=$(python -c "from ml_platform.config import ModelConfig; print(ModelConfig.load('model.yaml').model_id)")
+          REPO="${{ vars.MLP_MODEL_REPOSITORY_PREFIX || 'ml-models' }}/$MODEL_ID"
+          docker build -t "$ECR_REGISTRY/$REPO:$GITHUB_SHA" .
+          docker push "$ECR_REGISTRY/$REPO:$GITHUB_SHA"
+          DIGEST=$(aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$GITHUB_SHA" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "image_uri=$ECR_REGISTRY/$REPO@$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "model_id=$MODEL_ID" >> "$GITHUB_OUTPUT"
+      - name: Upsert and start pipeline
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+          OUTPUT_PREFIX: s3://${{ vars.MLP_ARTIFACTS_BUCKET }}/pipelines/${{ steps.image.outputs.model_id }}/${{ github.sha }}-${{ github.run_attempt }}
+        run: |
+          python -m ml_platform.build_pipeline --config model.yaml --upsert
+          python -m ml_platform.run_pipeline --config model.yaml --image-uri "$IMAGE_URI" \
+            --output-prefix "$OUTPUT_PREFIX" --source-commit "$GITHUB_SHA" --submitted-by "$GITHUB_ACTOR"
