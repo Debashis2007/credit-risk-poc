@@ -22,6 +22,7 @@ def test_local_lifecycle_against_mocked_aws():
     )
     out = result.stdout
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "pipeline   demo-credit-risk: Train -> Evaluate -> CheckMetric -> [PublishCandidate]" in out
     assert "status     PendingManualApproval" in out
     assert "idempotent=True" in out
     assert "submitter approves own model   -> 403" in out

@@ -1,8 +1,8 @@
-"""Approval console backend (FastAPI).
+"""Lifecycle console backend (FastAPI): training pipeline view and approvals.
 
 MLP_CONSOLE_MODE=local  (default) mocked AWS via scripts/local_e2e.LocalPlatform; the signed-in
                         user is chosen in the UI (X-Console-User header) instead of Okta.
-MLP_CONSOLE_MODE=remote lists packages from the real SageMaker registry (caller's AWS
+MLP_CONSOLE_MODE=remote lists packages and pipeline executions from SageMaker (caller's AWS
                         credentials, read-only) and forwards decisions to the private management
                         API (MLP_API_URL) with the browser's Okta bearer token. Approval rules are
                         enforced by the management API in both modes, never by this backend.
@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sys
 import tempfile
 import threading
@@ -52,6 +53,10 @@ class Arn(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     model_package_arn: str
+
+
+class TrainRequest(BaseModel):
+    shuffle_labels: bool = False
 
 
 # ----- shared helpers ----------------------------------------------------------------------
@@ -109,6 +114,93 @@ def _list_packages(sm: Any, group: str) -> list[dict[str, Any]]:
         if not page.get("NextToken"):
             return [sm.describe_model_package(ModelPackageName=a) for a in arns]
         kwargs["NextToken"] = page["NextToken"]
+
+
+def _ref(value: Any) -> Any:
+    """Render pipeline expressions ({"Get": "Parameters.X"}, JsonGet) as readable text."""
+    if isinstance(value, dict):
+        if "Get" in value:
+            return "${" + str(value["Get"]).replace("Parameters.", "") + "}"
+        if "Std:JsonGet" in value:
+            get = value["Std:JsonGet"]
+            return f"{get['PropertyFile']['Get'].split('.')[-1]}{get['Path'].lstrip('$')}"
+        if "Std:Join" in value:
+            return value["Std:Join"].get("On", "").join(str(_ref(v)) for v in value["Std:Join"].get("Values", []))
+    return value
+
+
+_CONDITION_OPS = {"GreaterThanOrEqualTo": ">=", "GreaterThan": ">", "LessThanOrEqualTo": "<=", "LessThan": "<",
+                  "Equals": "=="}
+
+
+def _step_details(step: dict[str, Any]) -> dict[str, Any]:
+    args = step.get("Arguments") or {}
+    if step["Type"] == "Training":
+        res = args.get("ResourceConfig") or {}
+        return {"image": _ref((args.get("AlgorithmSpecification") or {}).get("TrainingImage")),
+                "instance": f"{res.get('InstanceCount', 1)} × {_ref(res.get('InstanceType'))}",
+                "max_runtime_s": (args.get("StoppingCondition") or {}).get("MaxRuntimeInSeconds"),
+                "inputs": [c.get("ChannelName") for c in args.get("InputDataConfig") or []]}
+    if step["Type"] == "Processing":
+        res = (args.get("ProcessingResources") or {}).get("ClusterConfig") or {}
+        app_spec = args.get("AppSpecification") or {}
+        return {"image": _ref(app_spec.get("ImageUri")),
+                "instance": f"{res.get('InstanceCount', 1)} × {_ref(res.get('InstanceType'))}",
+                "entrypoint": " ".join(str(_ref(v)) for v in app_spec.get("ContainerEntrypoint") or []),
+                "outputs": [o.get("OutputName") for o in (args.get("ProcessingOutputConfig") or {}).get("Outputs", [])]}
+    if step["Type"] == "Condition":
+        return {"conditions": [f"{_ref(c.get('LeftValue'))} {_CONDITION_OPS.get(c['Type'], c['Type'])} "
+                               f"{_ref(c.get('RightValue'))}" for c in args.get("Conditions") or []],
+                "if_steps": [s["Name"] for s in args.get("IfSteps") or []],
+                "else_steps": [s["Name"] for s in args.get("ElseSteps") or []]}
+    return {}
+
+
+def _definition_view(definition: str) -> dict[str, Any]:
+    doc = json.loads(definition)
+    steps: list[dict[str, Any]] = []
+
+    def visit(items: list[dict[str, Any]], parent: str | None, branch: str | None) -> None:
+        for step in items:
+            refs = set(re.findall(r"Steps\.([A-Za-z0-9_-]+)\.", json.dumps(step.get("Arguments") or {})))
+            depends = sorted((refs | set(step.get("DependsOn") or [])) - {step["Name"]})
+            if parent and parent not in depends:
+                depends.append(parent)
+            steps.append({"name": step["Name"], "type": step["Type"], "depends_on": depends,
+                          "parent": parent, "branch": branch, "details": _step_details(step)})
+            args = step.get("Arguments") or {}
+            visit(args.get("IfSteps") or [], step["Name"], "if")
+            visit(args.get("ElseSteps") or [], step["Name"], "else")
+
+    visit(doc.get("Steps") or [], None, None)
+    params = [{"name": p["Name"], "type": p.get("Type"), "default": p.get("DefaultValue")}
+              for p in doc.get("Parameters") or []]
+    return {"steps": steps, "parameters": params}
+
+
+def _remote_runs(sm: Any, pipeline: str, limit: int = 10) -> list[dict[str, Any]]:
+    summaries = sm.list_pipeline_executions(PipelineName=pipeline, SortBy="CreationTime", SortOrder="Descending",
+                                            MaxResults=limit).get("PipelineExecutionSummaries", [])
+    runs = []
+    for s in summaries:
+        arn = s["PipelineExecutionArn"]
+        params = {p["Name"]: p["Value"] for p in
+                  sm.list_pipeline_parameters_for_execution(PipelineExecutionArn=arn).get("PipelineParameters", [])}
+        steps = []
+        for st in reversed(sm.list_pipeline_execution_steps(PipelineExecutionArn=arn).get("PipelineExecutionSteps", [])):
+            start, end = st.get("StartTime"), st.get("EndTime")
+            meta = st.get("Metadata") or {}
+            outcome = (meta.get("Condition") or {}).get("Outcome")
+            steps.append({"name": st["StepName"], "kind": "pipeline", "type": next(iter(meta), ""),
+                          "status": st.get("StepStatus"), "started_at": str(start or ""),
+                          "duration_ms": round((end - start).total_seconds() * 1000) if start and end else None,
+                          "detail": st.get("FailureReason", ""), "outputs": {"outcome": outcome} if outcome else {}})
+        gate = next((s_["outputs"].get("outcome") for s_ in steps if s_["type"] == "Condition"), None)
+        runs.append({"execution_arn": arn, "commit": params.get("SourceCommit"), "submitted_by": params.get("SubmittedBy"),
+                     "status": s.get("PipelineExecutionStatus"), "started_at": str(s.get("StartTime", "")),
+                     "ended_at": None, "gate": {"True": "passed", "False": "failed"}.get(gate or ""),
+                     "parameters": params, "metrics": {}, "thresholds": {}, "steps": steps, "model_package_arn": None})
+    return runs
 
 
 # ----- local mode --------------------------------------------------------------------------
@@ -176,6 +268,8 @@ def _start_local() -> None:
     lp = LocalPlatform(work)
     lp.bootstrap()
     submitters = [DATA_SCIENTIST_GITHUB, SUBMITTER_GITHUB]
+    if SEED_CANDIDATES:
+        lp.train_and_register(rows=3000, seed=99, submitted_by=DATA_SCIENTIST_GITHUB, shuffle_labels=True)
     for seed in range(1, SEED_CANDIDATES + 1):
         lp.train_and_register(rows=3000, seed=seed, submitted_by=submitters[(seed - 1) % len(submitters)])
     _state.update({"mock": mock, "lp": lp, "default_user": APPROVER})
@@ -291,10 +385,31 @@ def decision(req: Decision, x_console_user: Optional[str] = Header(default=None)
         return body
 
 
+@app.get("/api/pipeline")
+def pipeline() -> dict[str, Any]:
+    with _lock:
+        if MODE == "local":
+            lp = _local()
+            sm, name, runs = lp.sm, lp.cfg.pipeline_name, lp.runs
+        else:
+            sm, _ = _remote_clients()
+            name = os.environ.get("MLP_PIPELINE_NAME")
+            if not name:
+                from ml_platform.config import ModelConfig
+
+                name = ModelConfig.load(str(ROOT / "model.yaml")).pipeline_name
+            runs = _remote_runs(sm, name)
+        desc = sm.describe_pipeline(PipelineName=name)
+        return {"name": name, "arn": desc.get("PipelineArn"), "role_arn": desc.get("RoleArn"),
+                **_definition_view(desc["PipelineDefinition"]), "runs": runs}
+
+
 @app.post("/api/simulate/train")
-def simulate_train(x_console_user: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def simulate_train(req: Optional[TrainRequest] = None,
+                   x_console_user: Optional[str] = Header(default=None)) -> dict[str, Any]:
     if MODE != "local":
         raise HTTPException(404, "local mode only")
+    shuffle = bool(req and req.shuffle_labels)
     with _lock:
         lp = _local()
         user = _local_user(x_console_user)
@@ -302,9 +417,10 @@ def simulate_train(x_console_user: Optional[str] = Header(default=None)) -> dict
         if not item or not _identity_view(item, lp.cfg.tenant_id)["can_train"]:
             raise HTTPException(403, f"{user} cannot start training for tenant {lp.cfg.tenant_id}")
         result = lp.train_and_register(rows=3000, seed=random.randint(10, 10_000),
-                                       submitted_by=item.get("github_login") or user)
+                                       submitted_by=item.get("github_login") or user, shuffle_labels=shuffle)
     return {"registered": result.get("registered"), "metrics": result.get("metrics"),
-            "passed": result.get("passed"), "registration": result.get("registration")}
+            "passed": result.get("passed"), "registration": result.get("registration"),
+            "execution_arn": result.get("execution_arn")}
 
 
 @app.post("/api/simulate/console-approve")

@@ -21,7 +21,7 @@ holds the model, its configuration and the train workflow.
 | `tests/` | Local smoke test: data, train, evaluate, threshold gate, `model.yaml` validation |
 | `.github/workflows/ml-lifecycle.yml` | Test on every PR; build image and start the pipeline on `main` |
 | `scripts/local_e2e.py` | Full lifecycle against mocked AWS |
-| `ui/` | Approval console: React frontend (`ui/frontend`), FastAPI backend (`ui/backend`) |
+| `ui/` | Lifecycle console (pipeline and approvals): React frontend (`ui/frontend`), FastAPI backend (`ui/backend`) |
 
 ## Run locally
 
@@ -45,26 +45,36 @@ EventBridge. Fake credentials are forced, so it never touches a real account.
 | Stage | Real code | Mocked |
 |-------|-----------|--------|
 | Image push | — | ECR repository and digest |
-| Pipeline | `train.py`, `evaluate.py`, threshold gate, platform `publish_candidate.py` run locally | SageMaker pipeline execution and parameters, S3 staging |
+| Pipeline | The platform's pipeline definition (`build_steps`); `train.py`, `evaluate.py`, threshold gate, platform `publish_candidate.py` run locally | SageMaker pipeline execution and parameters, S3 staging |
 | Registration | Platform `register_candidate` Lambda (checksum copy-in, evidence, `PendingManualApproval`) | S3, DynamoDB, model registry |
 | Approval | Platform `approval_api` Lambda: self-approval refused (403), wrong hash refused (409), senior DS approval (200) | Okta claims passed as authorizer context |
 | Capture | Platform `capture_approval_event` Lambda: API approval confirmed and deploy parameter set; console approval flagged as violation | SSM, EventBridge |
 
 Promotion to Prod and endpoint releases are not part of the local run.
 
-## Approval console (React + FastAPI)
+## Lifecycle console (React + FastAPI)
 
 ![Approval console](docs/approval-console.png)
 
-A web console for senior data scientists to review candidates and approve or reject them.
-Approval rules are enforced by the platform's management API, never by the console.
+A web console with two tabs. Approval rules are enforced by the platform's management API, never
+by the console.
+
+- **Approvals:** senior data scientists review candidates and approve or reject them.
+- **Pipeline:** the training pipeline as the platform defines it (Train, Evaluate, CheckMetric,
+  then PublishCandidate when the gate is True), with the CI steps before it and registration,
+  registry status and the deploy signal after it. Pick an execution to see each step's status,
+  duration, outputs and the execution parameters; click a step for its definition (image,
+  instance, entrypoint, conditions). **Start run** trains a new candidate; **Start run on
+  shuffled labels** trains on labels with no signal, so the gate fails and nothing is
+  registered. Each package's provenance links to the run that produced it.
 
 ```bash
 ./ui/run_local.sh            # builds the frontend once, then serves http://127.0.0.1:8000
 ```
 
-- **Local mode (default):** runs on mocked AWS. Two candidates are trained and registered at
-  startup (v1 by `ds-submitter`, v2 by `lead-sds`). Switch the signed-in user to change role:
+- **Local mode (default):** runs on mocked AWS. At startup one run on shuffled labels fails the
+  gate, and two candidates are trained and registered (v1 by `ds-submitter`, v2 by `lead-sds`).
+  Switch the signed-in user to change role:
 
   | User | Role | Train | Approve |
   |------|------|-------|---------|
@@ -80,7 +90,8 @@ Approval rules are enforced by the platform's management API, never by the conso
   run** registers a new candidate submitted by the signed-in user; **Simulate console approval**
   approves outside the API to show violation detection.
 - **Remote mode:** `MLP_CONSOLE_MODE=remote MLP_API_URL=https://<api-id>-<vpce-id>.execute-api.<region>.amazonaws.com/v1 ./ui/run_local.sh`.
-  Packages are listed from the real registry with your AWS credentials (read-only), and
+  Packages and pipeline executions (set `MLP_PIPELINE_NAME` to override the name from
+  `model.yaml`) are listed from SageMaker with your AWS credentials (read-only), and
   decisions are sent to the private management API with the Okta access token pasted in the
   header. The API is private, so run the console from inside the VPC or over the VPN.
 

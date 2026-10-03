@@ -46,6 +46,52 @@ export type Package = {
   history?: HistoryEntry[];
 };
 
+export type StepDef = {
+  name: string;
+  type: string;
+  depends_on: string[];
+  parent: string | null;
+  branch: "if" | "else" | null;
+  details: Record<string, unknown>;
+};
+
+export type RunStep = {
+  name: string;
+  kind: "ci" | "pipeline" | "event";
+  type: string;
+  status: string;
+  started_at: string | null;
+  duration_ms: number | null;
+  detail: string;
+  outputs: Record<string, unknown>;
+};
+
+export type PipelineRun = {
+  execution_arn: string | null;
+  commit?: string;
+  submitted_by?: string;
+  rows?: number;
+  shuffle_labels?: boolean;
+  status: string;
+  gate: "passed" | "failed" | null;
+  started_at: string;
+  ended_at: string | null;
+  parameters: Record<string, string>;
+  metrics: Record<string, number>;
+  thresholds: Record<string, number>;
+  steps: RunStep[];
+  model_package_arn: string | null;
+};
+
+export type Pipeline = {
+  name: string;
+  arn?: string;
+  role_arn?: string;
+  steps: StepDef[];
+  parameters: { name: string; type?: string; default?: string }[];
+  runs: PipelineRun[];
+};
+
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -81,8 +127,11 @@ export const api = {
       "POST", "/api/decision",
       { model_package_arn: arn, decision, canonical_hash: canonicalHash, comment },
     ),
-  simulateTrain: () =>
-    request<{ registered: boolean; passed: boolean; metrics: Record<string, number> }>("POST", "/api/simulate/train"),
+  pipeline: () => request<Pipeline>("GET", "/api/pipeline"),
+  simulateTrain: (shuffleLabels = false) =>
+    request<{ registered: boolean; passed: boolean; metrics: Record<string, number>; execution_arn: string }>(
+      "POST", "/api/simulate/train", { shuffle_labels: shuffleLabels },
+    ),
   simulateConsoleApprove: (arn: string) =>
     request<{ capture_action: string; deploy_parameter: string | null }>(
       "POST", "/api/simulate/console-approve", { model_package_arn: arn },

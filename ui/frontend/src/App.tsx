@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError, auth, Identity, Package, Session } from "./api";
+import PipelineView from "./Pipeline";
 
 type Notice = { kind: "ok" | "error" | "warn"; text: string } | null;
 
@@ -143,8 +144,9 @@ function DecisionPanel({ pkg, session, onDone }: { pkg: Package; session: Sessio
   );
 }
 
-function Detail({ arn, session, refreshKey, onNotice, onChanged }: {
+function Detail({ arn, session, refreshKey, onNotice, onChanged, onOpenPipeline }: {
   arn: string; session: Session; refreshKey: number; onNotice: (n: Notice) => void; onChanged: () => void;
+  onOpenPipeline: (commit?: string) => void;
 }) {
   const [pkg, setPkg] = useState<Package | null>(null);
   useEffect(() => { api.pkg(arn).then(setPkg).catch((e) => onNotice({ kind: "error", text: e.message })); }, [arn, refreshKey, onNotice]);
@@ -181,7 +183,11 @@ function Detail({ arn, session, refreshKey, onNotice, onChanged }: {
           <h3>Provenance</h3>
           <dl>
             <dt>Submitted by</dt><dd>{submitterName(pkg.submitted_by, session)}</dd>
-            <dt>Source commit</dt><dd><code>{short(pkg.source_commit, 12)}</code></dd>
+            <dt>Source commit</dt>
+            <dd>
+              <code>{short(pkg.source_commit, 12)}</code>{" "}
+              <button className="link" onClick={() => onOpenPipeline(pkg.source_commit)}>view pipeline run</button>
+            </dd>
             <dt>Image digest</dt><dd><code title={pkg.image_uri}>{short(digest(pkg.image_uri), 23)}</code></dd>
             <dt>Artefact SHA-256</dt><dd><code title={pkg.model_data_sha256}>{short(pkg.model_data_sha256, 16)}</code></dd>
             <dt>Canonical hash</dt><dd><code title={pkg.canonical_hash}>{short(pkg.canonical_hash, 16)}</code></dd>
@@ -230,6 +236,11 @@ export default function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [training, setTraining] = useState(false);
   const [token, setToken] = useState(auth.token());
+  const [tab, setTab] = useState<"approvals" | "pipeline">("approvals");
+  const [focusCommit, setFocusCommit] = useState<string | null>(null);
+  const openPipeline = useCallback((commit?: string) => { setFocusCommit(commit ?? null); setTab("pipeline"); }, []);
+  const openPackage = useCallback((arn: string) => { setSelected(arn); setTab("approvals"); }, []);
+  const onError = useCallback((text: string) => setNotice({ kind: "error", text }), []);
 
   const load = useCallback(async () => {
     try {
@@ -251,16 +262,19 @@ export default function App() {
   const refresh = useCallback(() => { setRefreshKey((k) => k + 1); load(); }, [load]);
   const pending = useMemo(() => packages.filter((p) => p.approval_status === "PendingManualApproval").length, [packages]);
 
-  const simulateTrain = async () => {
+  const simulateTrain = async (shuffleLabels = false): Promise<string | undefined> => {
     setTraining(true);
+    setFocusCommit(null);
     try {
-      const r = await api.simulateTrain();
+      const r = await api.simulateTrain(shuffleLabels);
       const by = session?.me?.github_login ?? session?.user;
       setNotice(r.registered
         ? { kind: "ok", text: `Training run by ${by} passed (auc ${r.metrics.auc.toFixed(4)}); new candidate registered as PendingManualApproval.` }
         : { kind: "warn", text: `Training run by ${by} failed the evaluation gate (auc ${r.metrics.auc.toFixed(4)}); nothing registered.` });
       setSelected(null);
+      setRefreshKey((k) => k + 1);
       await load();
+      return r.execution_arn;
     } catch (e) {
       setNotice({ kind: "error", text: (e as Error).message });
     } finally {
@@ -276,7 +290,7 @@ export default function App() {
         <div className="brand">
           <span className="logo">◆</span>
           <div>
-            <div className="title">Model approval console</div>
+            <div className="title">Model lifecycle console</div>
             <div className="muted small">{session.tenant_id ? `${session.tenant_id} · ` : ""}{session.group}</div>
           </div>
         </div>
@@ -306,6 +320,21 @@ export default function App() {
         <div className={`notice banner ${notice.kind}`} onClick={() => setNotice(null)} title="Dismiss">{notice.text}</div>
       )}
 
+      <nav className="tabs">
+        <button className={tab === "approvals" ? "active" : ""} onClick={() => setTab("approvals")}>
+          Approvals {pending > 0 && <span className="count">{pending}</span>}
+        </button>
+        <button className={tab === "pipeline" ? "active" : ""} onClick={() => { setFocusCommit(null); setTab("pipeline"); }}>
+          Pipeline
+        </button>
+      </nav>
+
+      {tab === "pipeline" ? (
+        <main className="layout single">
+          <PipelineView session={session} packages={packages} refreshKey={refreshKey} training={training}
+            focusCommit={focusCommit} onTrain={simulateTrain} onOpenPackage={openPackage} onError={onError} />
+        </main>
+      ) : (
       <main className="layout">
         <aside className="list">
           <div className="list-head">
@@ -314,7 +343,7 @@ export default function App() {
           </div>
           {session.mode === "local" && (
             <>
-              <button className="primary wide" disabled={training || !session.me?.can_train} onClick={simulateTrain}>
+              <button className="primary wide" disabled={training || !session.me?.can_train} onClick={() => simulateTrain()}>
                 {training ? "Training…" : `Simulate training run as ${session.me?.github_login ?? session.user}`}
               </button>
               {!session.me?.can_train && (
@@ -344,11 +373,13 @@ export default function App() {
           {!packages.length && <p className="muted small">No model packages in {session.group}.</p>}
         </aside>
         {selected ? (
-          <Detail arn={selected} session={session} refreshKey={refreshKey} onNotice={setNotice} onChanged={refresh} />
+          <Detail arn={selected} session={session} refreshKey={refreshKey} onNotice={setNotice} onChanged={refresh}
+            onOpenPipeline={openPipeline} />
         ) : (
           <div className="detail muted">Select a package.</div>
         )}
       </main>
+      )}
     </div>
   );
 }

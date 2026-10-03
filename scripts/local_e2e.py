@@ -13,6 +13,7 @@ Usage (from the repo root, with the platform checked out in .platform):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -21,9 +22,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 ROOT = Path(__file__).resolve().parents[1]
 PLATFORM = Path(os.environ.get("MLP_PLATFORM_DIR", ROOT / ".platform")).resolve()
@@ -75,6 +78,35 @@ def _run_script(*args: str) -> None:
     subprocess.run([sys.executable, *args], check=True, cwd=ROOT, stdout=subprocess.DEVNULL)
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+@contextlib.contextmanager
+def _timed_step(run: dict[str, Any], name: str, kind: str, step_type: str) -> Iterator[dict[str, Any]]:
+    """Append a step record to `run`; it ends Succeeded unless the body sets another status or raises."""
+    step = {"name": name, "kind": kind, "type": step_type, "status": "Executing", "started_at": _now(),
+            "duration_ms": None, "detail": "", "outputs": {}}
+    run["steps"].append(step)
+    start = time.perf_counter()
+    try:
+        yield step
+        if step["status"] == "Executing":
+            step["status"] = "Succeeded"
+    except Exception as exc:
+        step["status"], step["detail"] = "Failed", str(exc)
+        raise
+    finally:
+        step["duration_ms"] = round((time.perf_counter() - start) * 1000)
+
+
+def pipeline_definition(cfg: ModelConfig) -> str:
+    """The platform's real SageMaker pipeline definition for this model.yaml."""
+    from ml_platform.steps import build_steps
+
+    return build_steps(cfg).definition()
+
+
 def api_event(method: str, email: str, body: dict | None = None, query: dict | None = None) -> dict:
     """API Gateway proxy event as the Okta TOKEN authorizer would pass it to approval_api."""
     return {"httpMethod": method, "requestContext": {"authorizer": {"email": email, "principalId": email}},
@@ -102,6 +134,7 @@ class LocalPlatform:
         self.ssm = boto3.client("ssm", region_name=self.region)
         self.ddb = boto3.resource("dynamodb", region_name=self.region)
         self._handlers: dict[str, Any] = {}
+        self.runs: list[dict[str, Any]] = []
 
     # ----- setup -------------------------------------------------------------------------
     def bootstrap(self) -> None:
@@ -118,7 +151,7 @@ class LocalPlatform:
                                 BillingMode="PAY_PER_REQUEST")
         self.sm.create_model_package_group(ModelPackageGroupName=self.cfg.model_package_group)
         self.sm.create_pipeline(PipelineName=self.cfg.pipeline_name, RoleArn=self.cfg.pipeline_role_arn,
-                                PipelineDefinition=json.dumps({"Version": "2020-12-01", "Steps": []}))
+                                PipelineDefinition=pipeline_definition(self.cfg))
         self.ecr.create_repository(repositoryName=self.ecr_repo)
         identity = self.ddb.Table(self.tables["identity"])
         for email, login, roles, tenants in IDENTITIES:
@@ -152,21 +185,50 @@ class LocalPlatform:
         return f"{self.account}.dkr.ecr.{self.region}.amazonaws.com/{self.ecr_repo}@{image['image']['imageId']['imageDigest']}"
 
     def run_pipeline(self, rows: int = 5000, seed: int = 1, commit: str | None = None,
-                     submitted_by: str = SUBMITTER_GITHUB, log=print) -> dict[str, Any]:
-        """Image push, data upload, pipeline steps run locally, candidate publish. Returns run info."""
-        cfg = self.cfg
+                     submitted_by: str = SUBMITTER_GITHUB, log=print, shuffle_labels: bool = False) -> dict[str, Any]:
+        """Image push, data upload, pipeline steps run locally, candidate publish. Returns run info.
+
+        Each step is recorded in `self.runs` (newest first). shuffle_labels trains on labels with no
+        signal so the CheckMetric gate fails.
+        """
         commit = commit or hashlib.sha1(uuid.uuid4().bytes).hexdigest()
+        run = {"execution_arn": None, "commit": commit, "submitted_by": submitted_by, "rows": rows,
+               "shuffle_labels": shuffle_labels, "started_at": _now(), "ended_at": None, "status": "Executing",
+               "gate": None, "thresholds": dict(self.cfg.thresholds), "metrics": {}, "parameters": {},
+               "steps": [], "model_package_arn": None}
+        self.runs.insert(0, run)
+        try:
+            info = self._run_pipeline(run, rows, seed, commit, submitted_by, log, shuffle_labels)
+            run["status"] = "Succeeded"
+            return info
+        except Exception:
+            run["status"] = "Failed"
+            raise
+        finally:
+            run["ended_at"] = _now()
+
+    def _run_pipeline(self, run: dict[str, Any], rows: int, seed: int, commit: str, submitted_by: str,
+                      log, shuffle_labels: bool) -> dict[str, Any]:
+        cfg = self.cfg
         run_dir = self.work / commit[:12]
-        image_uri = self.push_image(commit)
+        with _timed_step(run, "BuildImage", "ci", "GitHub Actions → ECR") as step:
+            image_uri = self.push_image(commit)
+            step["outputs"] = {"image_uri": image_uri}
         log(f"image      {image_uri}")
 
         train_dir, eval_dir = run_dir / "train", run_dir / "validation"
-        train_dir.mkdir(parents=True)
-        eval_dir.mkdir()
-        make_dataset(rows, seed=seed).to_csv(train_dir / "train.csv", index=False)
-        make_dataset(max(rows // 4, 500), seed=seed + 1000).to_csv(eval_dir / "validation.csv", index=False)
-        data_key = cfg.train_uri.split(f"s3://{self.data_bucket}/", 1)[1] + "train.csv"
-        self.s3.upload_file(str(train_dir / "train.csv"), self.data_bucket, data_key)
+        with _timed_step(run, "UploadData", "ci", "S3") as step:
+            train_dir.mkdir(parents=True)
+            eval_dir.mkdir()
+            train = make_dataset(rows, seed=seed)
+            if shuffle_labels:
+                train["default"] = train["default"].sample(frac=1.0, random_state=seed).to_numpy()
+                step["detail"] = "Training labels shuffled: the model has nothing to learn."
+            train.to_csv(train_dir / "train.csv", index=False)
+            make_dataset(max(rows // 4, 500), seed=seed + 1000).to_csv(eval_dir / "validation.csv", index=False)
+            data_key = cfg.train_uri.split(f"s3://{self.data_bucket}/", 1)[1] + "train.csv"
+            self.s3.upload_file(str(train_dir / "train.csv"), self.data_bucket, data_key)
+            step["outputs"] = {"data_uri": f"s3://{self.data_bucket}/{data_key}", "rows": rows}
         log(f"data       s3://{self.data_bucket}/{data_key} ({rows} rows)")
 
         output_prefix = f"s3://{self.staging_bucket}/pipelines/{cfg.model_id}/{commit}-1"
@@ -175,41 +237,60 @@ class LocalPlatform:
         execution_arn = self.sm.start_pipeline_execution(
             PipelineName=cfg.pipeline_name,
             PipelineParameters=[{"Name": k, "Value": v} for k, v in params.items()])["PipelineExecutionArn"]
+        run.update(execution_arn=execution_arn, parameters=params, image_uri=image_uri)
 
         model_dir, evaluation_dir, candidate_dir = run_dir / "model", run_dir / "evaluation", run_dir / "candidate"
-        _run_script("train.py", "--train", str(train_dir), "--model-dir", str(model_dir))
-        packaged = run_dir / "packaged"
-        packaged.mkdir()
-        with tarfile.open(packaged / "model.tar.gz", "w:gz") as tar:
-            for f in model_dir.iterdir():
-                tar.add(f, arcname=f.name)
         staging_prefix = output_prefix.split(self.staging_bucket + "/", 1)[1]
         model_key = f"{staging_prefix}/model/train-job/output/model.tar.gz"
-        self.s3.upload_file(str(packaged / "model.tar.gz"), self.staging_bucket, model_key)
+        packaged = run_dir / "packaged"
+        with _timed_step(run, "Train", "pipeline", "Training") as step:
+            _run_script("train.py", "--train", str(train_dir), "--model-dir", str(model_dir))
+            packaged.mkdir()
+            with tarfile.open(packaged / "model.tar.gz", "w:gz") as tar:
+                for f in model_dir.iterdir():
+                    tar.add(f, arcname=f.name)
+            self.s3.upload_file(str(packaged / "model.tar.gz"), self.staging_bucket, model_key)
+            step["outputs"] = {"model_artifact": f"s3://{self.staging_bucket}/{model_key}"}
         log("Train      model.tar.gz uploaded")
 
-        _run_script("evaluate.py", "--model-dir", str(model_dir), "--input-dir", str(eval_dir),
-                    "--output-dir", str(evaluation_dir))
-        metrics = json.loads((evaluation_dir / "metrics.json").read_text())
+        with _timed_step(run, "Evaluate", "pipeline", "Processing") as step:
+            _run_script("evaluate.py", "--model-dir", str(model_dir), "--input-dir", str(eval_dir),
+                        "--output-dir", str(evaluation_dir))
+            metrics = json.loads((evaluation_dir / "metrics.json").read_text())
+            step["outputs"] = {k: round(v, 4) if isinstance(v, float) else v for k, v in metrics.items()}
+        run["metrics"] = metrics
         log(f"Evaluate   auc={metrics['auc']:.4f} accuracy={metrics['accuracy']:.4f}")
-        failed = {m: metrics.get(m) for m, t in cfg.thresholds.items() if metrics.get(m, -1) < t}
+
+        with _timed_step(run, "CheckMetric", "pipeline", "Condition") as step:
+            failed = {m: metrics.get(m) for m, t in cfg.thresholds.items() if metrics.get(m, -1) < t}
+            step["outputs"] = {"outcome": "False" if failed else "True",
+                               "conditions": [f"{m} >= {t}" for m, t in cfg.thresholds.items()]}
+            if failed:
+                step["detail"] = "Below threshold: " + ", ".join(f"{m}={v:.4f}" for m, v in failed.items())
+        run["gate"] = "failed" if failed else "passed"
         log(f"CheckMetric thresholds {cfg.thresholds} -> {'FAIL ' + str(failed) if failed else 'pass'}")
         info = {"execution_arn": execution_arn, "commit": commit, "image_uri": image_uri,
                 "metrics": metrics, "passed": not failed}
         if failed:
+            run["steps"].append({"name": "PublishCandidate", "kind": "pipeline", "type": "Processing",
+                                 "status": "NotExecuted", "started_at": None, "duration_ms": None,
+                                 "detail": "CheckMetric was False and the else branch is empty.", "outputs": {}})
             return info
 
-        _run_script(str(PLATFORM / "ml_platform" / "scripts" / "publish_candidate.py"),
-                    "--model-dir", str(packaged), "--evaluation-dir", str(evaluation_dir),
-                    "--output-dir", str(candidate_dir),
-                    "--model-data-url", f"s3://{self.staging_bucket}/{model_key}",
-                    "--image-uri", image_uri, "--source-commit", commit, "--tenant-id", cfg.tenant_id,
-                    "--model-id", cfg.model_id, "--model-package-group", cfg.model_package_group,
-                    "--platform-version", cfg.platform_version, "--source-account-id", self.account,
-                    "--thresholds", json.dumps(cfg.thresholds))
-        self.s3.upload_file(str(candidate_dir / "candidate.json"), self.staging_bucket,
-                            f"{staging_prefix}/candidate/candidate.json")
-        info["candidate"] = json.loads((candidate_dir / "candidate.json").read_text())
+        with _timed_step(run, "PublishCandidate", "pipeline", "Processing") as step:
+            _run_script(str(PLATFORM / "ml_platform" / "scripts" / "publish_candidate.py"),
+                        "--model-dir", str(packaged), "--evaluation-dir", str(evaluation_dir),
+                        "--output-dir", str(candidate_dir),
+                        "--model-data-url", f"s3://{self.staging_bucket}/{model_key}",
+                        "--image-uri", image_uri, "--source-commit", commit, "--tenant-id", cfg.tenant_id,
+                        "--model-id", cfg.model_id, "--model-package-group", cfg.model_package_group,
+                        "--platform-version", cfg.platform_version, "--source-account-id", self.account,
+                        "--thresholds", json.dumps(cfg.thresholds))
+            candidate_key = f"{staging_prefix}/candidate/candidate.json"
+            self.s3.upload_file(str(candidate_dir / "candidate.json"), self.staging_bucket, candidate_key)
+            info["candidate"] = json.loads((candidate_dir / "candidate.json").read_text())
+            step["outputs"] = {"candidate": f"s3://{self.staging_bucket}/{candidate_key}",
+                               "model_data_sha256": info["candidate"].get("model_data_sha256")}
         log("Publish    candidate.json written (no registration inside the pipeline)")
         return info
 
@@ -219,15 +300,32 @@ class LocalPlatform:
                 "detail": {"currentPipelineExecutionStatus": "Succeeded", "pipelineExecutionArn": execution_arn}}
 
     def register(self, execution_arn: str) -> dict[str, Any]:
-        return self.handler("register_candidate").lambda_handler(self.pipeline_succeeded_event(execution_arn), None)
+        """What EventBridge does when an execution succeeds; the first call is recorded on the run."""
+        invoke = lambda: self.handler("register_candidate").lambda_handler(  # noqa: E731
+            self.pipeline_succeeded_event(execution_arn), None)
+        run = next((r for r in self.runs if r["execution_arn"] == execution_arn), None)
+        if run is None or any(s["name"] == "RegisterCandidate" for s in run["steps"]):
+            return invoke()
+        with _timed_step(run, "RegisterCandidate", "event", "EventBridge → Lambda") as step:
+            result = invoke()
+            code, body = result["statusCode"], result["body"]
+            if code == 200:
+                parsed = json.loads(body)
+                run["model_package_arn"] = parsed.get("model_package_arn")
+                step["outputs"] = parsed
+            else:
+                step["status"] = "Skipped" if code == 204 else "Failed"
+                step["detail"] = f"{code}: {body}"
+        return result
 
     def train_and_register(self, rows: int = 5000, seed: int = 1, submitted_by: str = DATA_SCIENTIST_GITHUB,
-                           log=lambda *_: None) -> dict[str, Any]:
-        info = self.run_pipeline(rows=rows, seed=seed, submitted_by=submitted_by, log=log)
-        if not info["passed"]:
-            return {**info, "registered": False}
+                           log=lambda *_: None, shuffle_labels: bool = False) -> dict[str, Any]:
+        info = self.run_pipeline(rows=rows, seed=seed, submitted_by=submitted_by, log=log,
+                                 shuffle_labels=shuffle_labels)
         reg = self.register(info["execution_arn"])
-        return {**info, "registered": reg["statusCode"] == 200, "registration": json.loads(reg["body"])}
+        if reg["statusCode"] != 200:
+            return {**info, "registered": False}
+        return {**info, "registered": True, "registration": json.loads(reg["body"])}
 
     # ----- approval + capture -------------------------------------------------------------
     def decide(self, email: str, package_arn: str, decision: str, canonical_hash: str, comment: str = "") -> dict:
@@ -271,6 +369,10 @@ def run(rows: int, work: Path) -> dict[str, Any]:
         _step("Platform bootstrap (mocked AWS)")
         lp.bootstrap()
         print(f"account {lp.account} ({cfg.training_target}), tables, buckets, group {cfg.model_package_group}")
+        steps = json.loads(lp.sm.describe_pipeline(PipelineName=cfg.pipeline_name)["PipelineDefinition"])["Steps"]
+        graph = [s["Name"] + "".join(f" -> [{t['Name']}]" for t in s.get("Arguments", {}).get("IfSteps", []))
+                 for s in steps]
+        print(f"pipeline   {cfg.pipeline_name}: {' -> '.join(graph)}")
 
         _step("CI image push + pipeline execution (SageMaker jobs run locally)")
         info = lp.run_pipeline(rows=rows, commit=hashlib.sha1(b"local-e2e").hexdigest())
