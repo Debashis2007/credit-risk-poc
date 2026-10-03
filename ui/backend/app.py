@@ -147,10 +147,27 @@ def _local_history(lp: Any, pkg: dict[str, Any]) -> list[dict[str, Any]]:
              "comment": i.get("comment") or i.get("reason")} for i in sorted(rows, key=lambda i: i["sk"])]
 
 
+APPROVER_ROLE = "senior_data_scientist"
+TRAINER_ROLES = {"senior_data_scientist", "data_scientist"}
+
+
+def _identity_view(item: dict[str, Any], tenant_id: str) -> dict[str, Any]:
+    """Mirror of the management API checks, for display only; the API remains the enforcer."""
+    roles = list(item.get("roles") or [])
+    tenants = list(item.get("tenants") or [])
+    active = item.get("status", "active") == "active"
+    in_tenant = tenant_id in tenants or "*" in tenants
+    return {"email": item["pk"], "github_login": item.get("github_login"), "roles": roles, "tenants": tenants,
+            "active": active, "in_tenant": in_tenant,
+            "can_approve": active and in_tenant and APPROVER_ROLE in roles,
+            "can_train": active and in_tenant and bool(TRAINER_ROLES & set(roles))}
+
+
 def _start_local() -> None:
     from moto import mock_aws
 
-    from local_e2e import APPROVER, LocalPlatform, force_fake_credentials
+    from local_e2e import (APPROVER, DATA_SCIENTIST_GITHUB, SUBMITTER_GITHUB, LocalPlatform,
+                           force_fake_credentials)
 
     force_fake_credentials()
     mock = mock_aws()
@@ -158,8 +175,9 @@ def _start_local() -> None:
     work = Path(tempfile.mkdtemp(prefix="mlp-console-"))
     lp = LocalPlatform(work)
     lp.bootstrap()
+    submitters = [DATA_SCIENTIST_GITHUB, SUBMITTER_GITHUB]
     for seed in range(1, SEED_CANDIDATES + 1):
-        lp.train_and_register(rows=3000, seed=seed)
+        lp.train_and_register(rows=3000, seed=seed, submitted_by=submitters[(seed - 1) % len(submitters)])
     _state.update({"mock": mock, "lp": lp, "default_user": APPROVER})
 
 
@@ -212,12 +230,14 @@ def startup() -> None:
 def session(x_console_user: Optional[str] = Header(default=None)) -> dict[str, Any]:
     if MODE == "local":
         lp = _local()
-        return {"mode": "local", "user": _local_user(x_console_user), "group": lp.cfg.model_package_group,
+        identities = [_identity_view(i, lp.cfg.tenant_id) for i in lp.identities()]
+        user = _local_user(x_console_user)
+        me = next((i for i in identities if i["email"] == user), None)
+        return {"mode": "local", "user": user, "me": me, "group": lp.cfg.model_package_group,
                 "model_id": lp.cfg.model_id, "tenant_id": lp.cfg.tenant_id,
-                "identities": [{"email": i["pk"], "roles": list(i.get("roles") or []),
-                                "github_login": i.get("github_login")} for i in lp.identities()],
+                "identities": sorted(identities, key=lambda i: (not i["can_approve"], i["email"])),
                 "deploy_parameter": lp.deploy_parameter()}
-    return {"mode": "remote", "user": None, "group": _group(), "identities": [], "deploy_parameter": None}
+    return {"mode": "remote", "user": None, "me": None, "group": _group(), "identities": [], "deploy_parameter": None}
 
 
 @app.get("/api/packages")
@@ -272,11 +292,17 @@ def decision(req: Decision, x_console_user: Optional[str] = Header(default=None)
 
 
 @app.post("/api/simulate/train")
-def simulate_train() -> dict[str, Any]:
+def simulate_train(x_console_user: Optional[str] = Header(default=None)) -> dict[str, Any]:
     if MODE != "local":
         raise HTTPException(404, "local mode only")
     with _lock:
-        result = _local().train_and_register(rows=3000, seed=random.randint(10, 10_000))
+        lp = _local()
+        user = _local_user(x_console_user)
+        item = next((i for i in lp.identities() if i["pk"] == user), None)
+        if not item or not _identity_view(item, lp.cfg.tenant_id)["can_train"]:
+            raise HTTPException(403, f"{user} cannot start training for tenant {lp.cfg.tenant_id}")
+        result = lp.train_and_register(rows=3000, seed=random.randint(10, 10_000),
+                                       submitted_by=item.get("github_login") or user)
     return {"registered": result.get("registered"), "metrics": result.get("metrics"),
             "passed": result.get("passed"), "registration": result.get("registration")}
 

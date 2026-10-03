@@ -1,8 +1,18 @@
-export type Identity = { email: string; roles: string[]; github_login?: string };
+export type Identity = {
+  email: string;
+  roles: string[];
+  github_login?: string;
+  tenants: string[];
+  active: boolean;
+  in_tenant: boolean;
+  can_approve: boolean;
+  can_train: boolean;
+};
 
 export type Session = {
   mode: "local" | "remote";
   user: string | null;
+  me: Identity | null;
   group: string;
   model_id?: string;
   tenant_id?: string;

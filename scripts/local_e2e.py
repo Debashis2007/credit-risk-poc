@@ -44,11 +44,22 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from make_synthetic_data import make_dataset  # noqa: E402
 from ml_platform.config import ModelConfig  # noqa: E402
 
-SUBMITTER = "data.scientist@example.com"
-SUBMITTER_GITHUB = "ds-submitter"
+DATA_SCIENTIST = "data.scientist@example.com"
+DATA_SCIENTIST_GITHUB = "ds-submitter"
 APPROVER = "senior.datascientist@example.com"
 APPROVER_GITHUB = "sds-approver"
+SUBMITTER = "lead.datascientist@example.com"
+SUBMITTER_GITHUB = "lead-sds"
 VIEWER = "analyst@example.com"
+
+# email, github login, roles, tenants ("demo" is replaced by the model's tenant)
+IDENTITIES = (
+    (APPROVER, APPROVER_GITHUB, ["senior_data_scientist"], ["demo"]),
+    (SUBMITTER, SUBMITTER_GITHUB, ["senior_data_scientist"], ["demo"]),
+    (DATA_SCIENTIST, DATA_SCIENTIST_GITHUB, ["data_scientist"], ["demo"]),
+    ("other.tenant.sds@example.com", "other-sds", ["senior_data_scientist"], ["other-tenant"]),
+    (VIEWER, "analyst", ["viewer"], ["demo"]),
+)
 
 
 def _load_handler(name: str) -> Any:
@@ -109,10 +120,9 @@ class LocalPlatform:
                                 PipelineDefinition=json.dumps({"Version": "2020-12-01", "Steps": []}))
         self.ecr.create_repository(repositoryName=self.ecr_repo)
         identity = self.ddb.Table(self.tables["identity"])
-        for email, login, roles in ((APPROVER, APPROVER_GITHUB, ["senior_data_scientist"]),
-                                    (SUBMITTER, SUBMITTER_GITHUB, ["senior_data_scientist"]),
-                                    (VIEWER, "analyst", ["viewer"])):
-            identity.put_item(Item={"pk": email, "roles": roles, "tenants": [self.cfg.tenant_id],
+        for email, login, roles, tenants in IDENTITIES:
+            tenants = [self.cfg.tenant_id if t == "demo" else t for t in tenants]
+            identity.put_item(Item={"pk": email, "roles": roles, "tenants": tenants,
                                     "status": "active", "github_login": login})
         os.environ.update({
             "LIFECYCLE_TABLE": self.tables["lifecycle"], "DECISION_LOG_TABLE": self.tables["decision_log"],
@@ -210,8 +220,9 @@ class LocalPlatform:
     def register(self, execution_arn: str) -> dict[str, Any]:
         return self.handler("register_candidate").lambda_handler(self.pipeline_succeeded_event(execution_arn), None)
 
-    def train_and_register(self, rows: int = 5000, seed: int = 1, log=lambda *_: None) -> dict[str, Any]:
-        info = self.run_pipeline(rows=rows, seed=seed, log=log)
+    def train_and_register(self, rows: int = 5000, seed: int = 1, submitted_by: str = DATA_SCIENTIST_GITHUB,
+                           log=lambda *_: None) -> dict[str, Any]:
+        info = self.run_pipeline(rows=rows, seed=seed, submitted_by=submitted_by, log=log)
         if not info["passed"]:
             return {**info, "registered": False}
         reg = self.register(info["execution_arn"])

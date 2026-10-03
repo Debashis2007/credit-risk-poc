@@ -1,7 +1,41 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError, auth, Package, Session } from "./api";
+import { api, ApiError, auth, Identity, Package, Session } from "./api";
 
 type Notice = { kind: "ok" | "error" | "warn"; text: string } | null;
+
+const ROLE_LABELS: Record<string, string> = {
+  senior_data_scientist: "Senior data scientist",
+  data_scientist: "Data scientist",
+  viewer: "Viewer",
+};
+const roleLabel = (i: Identity) =>
+  (i.roles.map((r) => ROLE_LABELS[r] ?? r).join(", ") || "No role") + (i.in_tenant ? "" : " · other tenant");
+
+function permission(i: Identity | null): { cls: string; text: string } | null {
+  if (!i) return null;
+  if (i.can_approve) return { cls: "approved", text: "Can approve" };
+  if (i.can_train) return { cls: "pending", text: "Can train, cannot approve" };
+  return { cls: "rejected", text: "View only" };
+}
+
+/** Same order as the management API checks; display only, the API is the enforcer. */
+function blockedReason(me: Identity | null, pkg: Package, tenant?: string): string | null {
+  if (!me) return null;
+  if (!me.active) return "Your identity is not active.";
+  if (!me.in_tenant) return `Your approver scope does not include tenant ${tenant ?? pkg.tenant_id}.`;
+  if (!me.roles.includes("senior_data_scientist"))
+    return `Your role (${roleLabel(me)}) can review but not approve. Approval requires Senior data scientist.`;
+  const submitter = (pkg.submitted_by ?? "").toLowerCase();
+  if (submitter && [me.email, me.github_login ?? ""].map((v) => v.toLowerCase()).includes(submitter))
+    return "You submitted this candidate. Separation of duties: another senior data scientist must approve it.";
+  return null;
+}
+
+function submitterName(login: string | undefined, session: Session) {
+  if (!login) return "unknown submitter";
+  const who = session.identities.find((i) => i.github_login === login || i.email === login);
+  return who ? `${login} (${who.email})` : login;
+}
 
 const short = (value?: string | null, n = 12) => (value ? (value.length > n ? `${value.slice(0, n)}…` : value) : "—");
 const digest = (image?: string) => (image?.includes("@sha256:") ? image.split("@")[1] : image);
@@ -57,6 +91,7 @@ function DecisionPanel({ pkg, session, onDone }: { pkg: Package; session: Sessio
   if (!pkg.platform_registered) {
     return <div className="notice warn">This package was not registered by the platform and cannot be approved.</div>;
   }
+  const blocked = blockedReason(session.me, pkg, session.tenant_id);
 
   const decide = async (decision: "approve" | "reject") => {
     setBusy(true);
@@ -79,17 +114,29 @@ function DecisionPanel({ pkg, session, onDone }: { pkg: Package; session: Sessio
     <section className="card">
       <h3>Decision</h3>
       <p className="muted small">
-        Signed in as <b>{session.mode === "local" ? auth.user() || session.user : "Okta user"}</b>. The management API
-        checks role, tenant scope, separation of duties and the hash binding.
+        Signed in as <b>{session.mode === "local" ? session.me?.email ?? session.user : "Okta user"}</b>
+        {session.me && <> · {roleLabel(session.me)}</>}. The management API checks role, tenant scope, separation of
+        duties and the hash binding.
       </p>
-      <textarea placeholder="Comment (recorded in the decision log)" value={comment} onChange={(e) => setComment(e.target.value)} />
+      {blocked && (
+        <div className="notice warn blocked">
+          {blocked}
+          {session.mode === "local" && (
+            <button className="ghost small" disabled={busy} onClick={() => decide("approve")}>
+              Send approval anyway to see the API refusal
+            </button>
+          )}
+        </div>
+      )}
+      <textarea placeholder="Comment (recorded in the decision log)" value={comment} disabled={!!blocked}
+        onChange={(e) => setComment(e.target.value)} />
       <label className="check">
-        <input type="checkbox" checked={reviewed} onChange={(e) => setReviewed(e.target.checked)} />
+        <input type="checkbox" checked={reviewed} disabled={!!blocked} onChange={(e) => setReviewed(e.target.checked)} />
         I reviewed the evidence for candidate <code>{short(pkg.canonical_hash, 16)}</code>
       </label>
       <div className="actions">
-        <button className="approve" disabled={!reviewed || busy} onClick={() => decide("approve")}>Approve</button>
-        <button className="reject" disabled={!reviewed || busy} onClick={() => decide("reject")}>Reject</button>
+        <button className="approve" disabled={!!blocked || !reviewed || busy} onClick={() => decide("approve")}>Approve</button>
+        <button className="reject" disabled={!!blocked || !reviewed || busy} onClick={() => decide("reject")}>Reject</button>
       </div>
       {refusal && <div className="notice error inline">{refusal}</div>}
     </section>
@@ -133,7 +180,7 @@ function Detail({ arn, session, refreshKey, onNotice, onChanged }: {
         <section className="card">
           <h3>Provenance</h3>
           <dl>
-            <dt>Submitted by</dt><dd>{pkg.submitted_by || "—"}</dd>
+            <dt>Submitted by</dt><dd>{submitterName(pkg.submitted_by, session)}</dd>
             <dt>Source commit</dt><dd><code>{short(pkg.source_commit, 12)}</code></dd>
             <dt>Image digest</dt><dd><code title={pkg.image_uri}>{short(digest(pkg.image_uri), 23)}</code></dd>
             <dt>Artefact SHA-256</dt><dd><code title={pkg.model_data_sha256}>{short(pkg.model_data_sha256, 16)}</code></dd>
@@ -186,7 +233,11 @@ export default function App() {
 
   const load = useCallback(async () => {
     try {
-      const [s, p] = await Promise.all([api.session(), api.packages()]);
+      let [s, p] = await Promise.all([api.session(), api.packages()]);
+      if (s.mode === "local" && !s.me && auth.user()) {
+        auth.setUser("");
+        s = await api.session();
+      }
       setSession(s);
       setPackages(p);
       if (s.mode === "local" && !auth.user() && s.user) auth.setUser(s.user);
@@ -204,10 +255,14 @@ export default function App() {
     setTraining(true);
     try {
       const r = await api.simulateTrain();
+      const by = session?.me?.github_login ?? session?.user;
       setNotice(r.registered
-        ? { kind: "ok", text: `Training run passed (auc ${r.metrics.auc.toFixed(4)}); new candidate registered as PendingManualApproval.` }
-        : { kind: "warn", text: `Training run failed the evaluation gate (auc ${r.metrics.auc.toFixed(4)}); nothing registered.` });
+        ? { kind: "ok", text: `Training run by ${by} passed (auc ${r.metrics.auc.toFixed(4)}); new candidate registered as PendingManualApproval.` }
+        : { kind: "warn", text: `Training run by ${by} failed the evaluation gate (auc ${r.metrics.auc.toFixed(4)}); nothing registered.` });
+      setSelected(null);
       await load();
+    } catch (e) {
+      setNotice({ kind: "error", text: (e as Error).message });
     } finally {
       setTraining(false);
     }
@@ -230,11 +285,15 @@ export default function App() {
           {session.mode === "local" ? (
             <label className="user">
               Signed in as
-              <select value={auth.user() || session.user || ""} onChange={(e) => { auth.setUser(e.target.value); refresh(); }}>
+              <select value={session.me?.email ?? session.user ?? ""}
+                onChange={(e) => { auth.setUser(e.target.value); setNotice(null); refresh(); }}>
                 {session.identities.map((i) => (
-                  <option key={i.email} value={i.email}>{i.email} ({i.roles.join(", ")})</option>
+                  <option key={i.email} value={i.email}>{i.email} — {roleLabel(i)}</option>
                 ))}
               </select>
+              {permission(session.me) && (
+                <span className={`pill ${permission(session.me)!.cls}`}>{permission(session.me)!.text}</span>
+              )}
             </label>
           ) : (
             <input className="token" type="password" placeholder="Okta access token" value={token}
@@ -254,9 +313,14 @@ export default function App() {
             <button className="ghost small" onClick={refresh}>Refresh</button>
           </div>
           {session.mode === "local" && (
-            <button className="primary wide" disabled={training} onClick={simulateTrain}>
-              {training ? "Training…" : "Simulate training run"}
-            </button>
+            <>
+              <button className="primary wide" disabled={training || !session.me?.can_train} onClick={simulateTrain}>
+                {training ? "Training…" : `Simulate training run as ${session.me?.github_login ?? session.user}`}
+              </button>
+              {!session.me?.can_train && (
+                <p className="muted small">Training needs a data scientist role in tenant {session.tenant_id}.</p>
+              )}
+            </>
           )}
           {session.deploy_parameter && (
             <div className="deploy small">Deploy signal → version {session.deploy_parameter.split("/").pop()}</div>
@@ -271,7 +335,7 @@ export default function App() {
                 </div>
                 <div className="row muted small">
                   <span>auc {p.metrics.auc !== undefined ? p.metrics.auc.toFixed(3) : "—"}</span>
-                  <span>{p.submitted_by || "unknown submitter"}</span>
+                  <span>by {p.submitted_by || "unknown"}</span>
                 </div>
                 <div className="muted small">commit {short(p.source_commit, 8)} · {when(p.created_at)}</div>
               </li>
