@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError, auth, Identity, Package, Pipeline, Session } from "./api";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  api, ApiError, auth, Identity, login, LoginState, Package, Pipeline, Session, setUnauthorizedHandler,
+} from "./api";
 import PipelineView from "./Pipeline";
 
 type Notice = { kind: "ok" | "error" | "warn"; text: string } | null;
@@ -228,7 +230,54 @@ function Detail({ arn, session, refreshKey, onNotice, onChanged, onOpenPipeline 
   );
 }
 
+function LoginScreen({ project, onSignedIn }: { project: string; onSignedIn: (s: LoginState) => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      onSignedIn(await login.signIn(username, password));
+    } catch (err) {
+      setError((err as Error).message);
+      setPassword("");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="login-page">
+      <form className="card login" onSubmit={submit}>
+        <div className="brand"><span className="logo">◆</span><div className="title">{project}</div></div>
+        <p className="muted small">Sign in to the model lifecycle console.</p>
+        <label>Username<input autoFocus autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label>
+        <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+        {error && <div className="notice error">{error}</div>}
+        <button className="primary wide" disabled={busy || !username || !password}>{busy ? "Signing in…" : "Sign in"}</button>
+      </form>
+    </div>
+  );
+}
+
 export default function App() {
+  const [state, setState] = useState<LoginState | null>(null);
+  useEffect(() => {
+    setUnauthorizedHandler(() => setState((s) => (s ? { ...s, user: null } : s)));
+    login.me().then(setState).catch(() => setState({ enabled: true, user: null, project: "Console" }));
+  }, []);
+
+  if (!state) return <div className="loading">Loading…</div>;
+  if (state.enabled && !state.user) return <LoginScreen project={state.project} onSignedIn={setState} />;
+  const signOut = async () => { await login.signOut(); setState({ ...state, user: null }); };
+  return <Console signedIn={state.enabled ? state.user : null} onSignOut={signOut} />;
+}
+
+function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: () => void }) {
   const [session, setSession] = useState<Session | null>(null);
   const [packages, setPackages] = useState<Package[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -333,6 +382,11 @@ export default function App() {
           ) : (
             <input className="token" type="password" placeholder="Okta access token" value={token}
               onChange={(e) => { setToken(e.target.value); auth.setToken(e.target.value); }} />
+          )}
+          {signedIn && (
+            <span className="signed-in small">
+              {signedIn} <button className="ghost small" onClick={onSignOut}>Log out</button>
+            </span>
           )}
         </div>
       </header>

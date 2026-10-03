@@ -110,12 +110,31 @@ export const auth = {
   setToken: (token: string) => sessionStorage.setItem(TOKEN_KEY, token),
 };
 
+export type LoginState = { enabled: boolean; user: string | null; project: string };
+
+let onUnauthorized: (() => void) | null = null;
+export const setUnauthorizedHandler = (handler: () => void) => { onUnauthorized = handler; };
+
+export const login = {
+  me: async (): Promise<LoginState> => (await fetch("/api/auth/me")).json(),
+  signIn: async (username: string, password: string): Promise<LoginState> => {
+    const res = await fetch("/api/auth/login", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new ApiError(res.status, data.detail ?? res.statusText);
+    return data as LoginState;
+  },
+  signOut: () => fetch("/api/auth/logout", { method: "POST" }),
+};
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (auth.user()) headers["X-Console-User"] = auth.user();
   if (auth.token()) headers["Authorization"] = `Bearer ${auth.token()}`;
   const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && data.detail === "login required") onUnauthorized?.();
   if (!res.ok) throw new ApiError(res.status, data.detail ?? data.error ?? res.statusText);
   return data as T;
 }

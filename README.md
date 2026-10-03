@@ -102,6 +102,24 @@ by the console.
 Frontend development with hot reload: run the backend as above, then `cd ui/frontend && npm run dev`
 (http://127.0.0.1:5173, proxies `/api` to port 8000).
 
+### Hosting
+
+`ui/Dockerfile` builds the console as one container; `railway.json` deploys it on Railway. A hosted
+console requires a login: the image sets `CONSOLE_AUTH_REQUIRED=1` and refuses to start without
+users. Configure each deployment with its own values, never shared with other projects:
+
+| Variable | Value |
+|----------|-------|
+| `CONSOLE_USERS` | `username:<hash>` entries, comma-separated; hash from `python ui/backend/auth.py hash` |
+| `CONSOLE_SESSION_SECRET` | from `python ui/backend/auth.py secret` |
+| `CONSOLE_PROJECT` | project name, e.g. `credit-risk`; bound into the session and the cookie name |
+| `CONSOLE_SESSION_HOURS` | session lifetime, default 12 |
+
+Sessions are signed with the deployment's secret and bound to its project, and the cookie is
+host-only, so a session from one project's console is never sent to, or accepted by, another.
+Failed logins are throttled (5 per 15 minutes per client). Without `CONSOLE_USERS`, as in
+`./ui/run_local.sh`, the console is open.
+
 ## Lifecycle
 
 1. **Data:** generate and upload the training set to `data.train_uri`:

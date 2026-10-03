@@ -37,7 +37,13 @@ SEED_CANDIDATES = int(os.environ.get("MLP_CONSOLE_SEED_CANDIDATES", "2"))
 STEP_PACE_S = float(os.environ.get("MLP_CONSOLE_STEP_PACE_S", "0.8"))
 DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 
-app = FastAPI(title="ML Platform approval console")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from auth import Auth, install  # noqa: E402
+
+AUTH = Auth()
+app = FastAPI(title="ML Platform lifecycle console",
+              **({"docs_url": None, "redoc_url": None, "openapi_url": None} if AUTH.enabled else {}))
+install(app, AUTH)
 _lock = threading.Lock()
 _state: dict[str, Any] = {}
 

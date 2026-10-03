@@ -162,6 +162,11 @@ button.link { background: none; border: none; padding: 0; color: var(--brand); f
 .runs tbody tr:hover { background: #f7f8fb; }
 .runs tr.active { background: #f1f4fd; }
 .card:has(.runs) { overflow-x: auto; }
+.login-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.login { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 12px; }
+.login label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.login input { font: inherit; font-size: 14px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; }
+.signed-in { display: flex; align-items: center; gap: 8px; color: var(--muted); padding-left: 12px; border-left: 1px solid var(--border); }
 .notice.inline { margin-top: 12px; }
 .notice.blocked { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
 .user .pill { margin-left: 4px; }
