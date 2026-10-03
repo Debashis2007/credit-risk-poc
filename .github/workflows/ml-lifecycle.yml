@@ -37,6 +37,9 @@ jobs:
         run: python -c "from ml_platform.config import ModelConfig; print(ModelConfig.load('model.yaml').tags())"
       - name: Build pipeline definition
         run: python -m ml_platform.build_pipeline --config model.yaml
+      - name: Type-check and build approval console
+        working-directory: ui/frontend
+        run: npm ci --no-fund --no-audit && npm run build
 
   train:
     needs: test

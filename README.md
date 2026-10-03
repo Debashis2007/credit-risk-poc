@@ -20,6 +20,8 @@ holds the model, its configuration and the train workflow.
 | `scripts/make_synthetic_data.py` | Synthetic numeric dataset with a `default` target |
 | `tests/` | Local smoke test: data, train, evaluate, threshold gate, `model.yaml` validation |
 | `.github/workflows/ml-lifecycle.yml` | Test on every PR; build image and start the pipeline on `main` |
+| `scripts/local_e2e.py` | Full lifecycle against mocked AWS |
+| `ui/` | Approval console: React frontend (`ui/frontend`), FastAPI backend (`ui/backend`) |
 
 ## Run locally
 
@@ -49,6 +51,32 @@ EventBridge. Fake credentials are forced, so it never touches a real account.
 | Capture | Platform `capture_approval_event` Lambda: API approval confirmed and deploy parameter set; console approval flagged as violation | SSM, EventBridge |
 
 Promotion to Prod and endpoint releases are not part of the local run.
+
+## Approval console (React + FastAPI)
+
+![Approval console](docs/approval-console.png)
+
+A web console for senior data scientists to review candidates and approve or reject them.
+Approval rules are enforced by the platform's management API, never by the console.
+
+```bash
+./ui/run_local.sh            # builds the frontend once, then serves http://127.0.0.1:8000
+```
+
+- **Local mode (default):** runs on mocked AWS. Two candidates are trained and registered at
+  startup. Switch the signed-in user to see the API's checks: the submitter
+  (`data.scientist@example.com`) is refused by separation of duties, the viewer is refused for
+  lacking the role, and `senior.datascientist@example.com` can approve. Approvals run the
+  capture Lambda, so the deploy signal and decision log update live. **Simulate training run**
+  registers a new candidate; **Simulate console approval** approves outside the API to show
+  violation detection.
+- **Remote mode:** `MLP_CONSOLE_MODE=remote MLP_API_URL=https://<api-id>-<vpce-id>.execute-api.<region>.amazonaws.com/v1 ./ui/run_local.sh`.
+  Packages are listed from the real registry with your AWS credentials (read-only), and
+  decisions are sent to the private management API with the Okta access token pasted in the
+  header. The API is private, so run the console from inside the VPC or over the VPN.
+
+Frontend development with hot reload: run the backend as above, then `cd ui/frontend && npm run dev`
+(http://127.0.0.1:5173, proxies `/api` to port 8000).
 
 ## Lifecycle
 
