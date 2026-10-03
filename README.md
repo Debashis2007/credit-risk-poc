@@ -64,12 +64,21 @@ Approval rules are enforced by the platform's management API, never by the conso
 ```
 
 - **Local mode (default):** runs on mocked AWS. Two candidates are trained and registered at
-  startup. Switch the signed-in user to see the API's checks: the submitter
-  (`data.scientist@example.com`) is refused by separation of duties, the viewer is refused for
-  lacking the role, and `senior.datascientist@example.com` can approve. Approvals run the
-  capture Lambda, so the deploy signal and decision log update live. **Simulate training run**
-  registers a new candidate; **Simulate console approval** approves outside the API to show
-  violation detection.
+  startup (v1 by `ds-submitter`, v2 by `lead-sds`). Switch the signed-in user to change role:
+
+  | User | Role | Train | Approve |
+  |------|------|-------|---------|
+  | `senior.datascientist@example.com` | Senior data scientist | Yes | Yes, except candidates they submitted |
+  | `lead.datascientist@example.com` | Senior data scientist | Yes | Yes, except candidates they submitted (v2) |
+  | `data.scientist@example.com` | Data scientist | Yes | No (role) |
+  | `other.tenant.sds@example.com` | Senior data scientist, other tenant | No | No (tenant scope) |
+  | `analyst@example.com` | Viewer | No | No (role) |
+
+  The console disables actions the signed-in user isn't allowed to take and says why. **Send
+  approval anyway** submits the request so you can see the management API refuse it. Approvals
+  run the capture Lambda, so the deploy signal and decision log update live. **Simulate training
+  run** registers a new candidate submitted by the signed-in user; **Simulate console approval**
+  approves outside the API to show violation detection.
 - **Remote mode:** `MLP_CONSOLE_MODE=remote MLP_API_URL=https://<api-id>-<vpce-id>.execute-api.<region>.amazonaws.com/v1 ./ui/run_local.sh`.
   Packages are listed from the real registry with your AWS credentials (read-only), and
   decisions are sent to the private management API with the Okta access token pasted in the
