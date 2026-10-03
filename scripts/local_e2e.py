@@ -52,13 +52,14 @@ SUBMITTER = "lead.datascientist@example.com"
 SUBMITTER_GITHUB = "lead-sds"
 VIEWER = "analyst@example.com"
 
-# email, github login, roles, tenants ("demo" is replaced by the model's tenant)
+# email, github login, roles, tenants (TENANT is replaced by the model's tenant)
+TENANT = "<model-tenant>"
 IDENTITIES = (
-    (APPROVER, APPROVER_GITHUB, ["senior_data_scientist"], ["demo"]),
-    (SUBMITTER, SUBMITTER_GITHUB, ["senior_data_scientist"], ["demo"]),
-    (DATA_SCIENTIST, DATA_SCIENTIST_GITHUB, ["data_scientist"], ["demo"]),
+    (APPROVER, APPROVER_GITHUB, ["senior_data_scientist"], [TENANT]),
+    (SUBMITTER, SUBMITTER_GITHUB, ["senior_data_scientist"], [TENANT]),
+    (DATA_SCIENTIST, DATA_SCIENTIST_GITHUB, ["data_scientist"], [TENANT]),
     ("other.tenant.sds@example.com", "other-sds", ["senior_data_scientist"], ["other-tenant"]),
-    (VIEWER, "analyst", ["viewer"], ["demo"]),
+    (VIEWER, "analyst", ["viewer"], [TENANT]),
 )
 
 
@@ -121,7 +122,7 @@ class LocalPlatform:
         self.ecr.create_repository(repositoryName=self.ecr_repo)
         identity = self.ddb.Table(self.tables["identity"])
         for email, login, roles, tenants in IDENTITIES:
-            tenants = [self.cfg.tenant_id if t == "demo" else t for t in tenants]
+            tenants = [self.cfg.tenant_id if t == TENANT else t for t in tenants]
             identity.put_item(Item={"pk": email, "roles": roles, "tenants": tenants,
                                     "status": "active", "github_login": login})
         os.environ.update({
