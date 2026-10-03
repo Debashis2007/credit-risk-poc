@@ -67,6 +67,7 @@ export type RunStep = {
 };
 
 export type PipelineRun = {
+  run_id: string;
   execution_arn: string | null;
   commit?: string;
   submitted_by?: string;
@@ -90,6 +91,7 @@ export type Pipeline = {
   steps: StepDef[];
   parameters: { name: string; type?: string; default?: string }[];
   runs: PipelineRun[];
+  active_run_id: string | null;
 };
 
 export class ApiError extends Error {
@@ -129,9 +131,7 @@ export const api = {
     ),
   pipeline: () => request<Pipeline>("GET", "/api/pipeline"),
   simulateTrain: (shuffleLabels = false) =>
-    request<{ registered: boolean; passed: boolean; metrics: Record<string, number>; execution_arn: string }>(
-      "POST", "/api/simulate/train", { shuffle_labels: shuffleLabels },
-    ),
+    request<{ run_id: string }>("POST", "/api/simulate/train", { shuffle_labels: shuffleLabels }),
   simulateConsoleApprove: (arn: string) =>
     request<{ capture_action: string; deploy_parameter: string | null }>(
       "POST", "/api/simulate/console-approve", { model_package_arn: arn },

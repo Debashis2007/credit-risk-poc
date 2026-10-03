@@ -67,6 +67,10 @@ by the console.
   instance, entrypoint, conditions). **Start run** trains a new candidate; **Start run on
   shuffled labels** trains on labels with no signal, so the gate fails and nothing is
   registered. Each package's provenance links to the run that produced it.
+  **Where it stands** highlights the flow's current position: the step running now (live, with
+  progress), the registry while a candidate waits for approval, the deploy signal once approved,
+  or the step where a run stopped. Local steps are paced (`MLP_CONSOLE_STEP_PACE_S`, default
+  0.8 s) so a run can be followed; set it to `0` to run at full speed.
 
 ```bash
 ./ui/run_local.sh            # builds the frontend once, then serves http://127.0.0.1:8000

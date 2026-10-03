@@ -52,7 +52,7 @@ def test_registered_pipeline_is_the_platform_definition(result):
 def test_passing_run_records_every_step_and_the_package(result):
     run = result["runs"][1]
     steps = _steps(run)
-    assert run["status"] == "Succeeded" and run["gate"] == "passed"
+    assert run["status"] == "Succeeded" and run["gate"] == "passed" and run["run_id"]
     assert list(steps) == ["BuildImage", "UploadData", "Train", "Evaluate", "CheckMetric", "PublishCandidate",
                            "RegisterCandidate"]
     assert all(s["status"] == "Succeeded" for s in steps.values())

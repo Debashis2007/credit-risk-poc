@@ -20,6 +20,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -33,6 +34,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 MODE = os.environ.get("MLP_CONSOLE_MODE", "local").lower()
 SEED_CANDIDATES = int(os.environ.get("MLP_CONSOLE_SEED_CANDIDATES", "2"))
+STEP_PACE_S = float(os.environ.get("MLP_CONSOLE_STEP_PACE_S", "0.8"))
 DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 
 app = FastAPI(title="ML Platform approval console")
@@ -196,7 +198,7 @@ def _remote_runs(sm: Any, pipeline: str, limit: int = 10) -> list[dict[str, Any]
                           "duration_ms": round((end - start).total_seconds() * 1000) if start and end else None,
                           "detail": st.get("FailureReason", ""), "outputs": {"outcome": outcome} if outcome else {}})
         gate = next((s_["outputs"].get("outcome") for s_ in steps if s_["type"] == "Condition"), None)
-        runs.append({"execution_arn": arn, "commit": params.get("SourceCommit"), "submitted_by": params.get("SubmittedBy"),
+        runs.append({"run_id": arn, "execution_arn": arn, "commit": params.get("SourceCommit"), "submitted_by": params.get("SubmittedBy"),
                      "status": s.get("PipelineExecutionStatus"), "started_at": str(s.get("StartTime", "")),
                      "ended_at": None, "gate": {"True": "passed", "False": "failed"}.get(gate or ""),
                      "parameters": params, "metrics": {}, "thresholds": {}, "steps": steps, "model_package_arn": None})
@@ -272,7 +274,31 @@ def _start_local() -> None:
         lp.train_and_register(rows=3000, seed=99, submitted_by=DATA_SCIENTIST_GITHUB, shuffle_labels=True)
     for seed in range(1, SEED_CANDIDATES + 1):
         lp.train_and_register(rows=3000, seed=seed, submitted_by=submitters[(seed - 1) % len(submitters)])
-    _state.update({"mock": mock, "lp": lp, "default_user": APPROVER})
+    lp.step_pace_s = STEP_PACE_S
+    desc = lp.sm.describe_pipeline(PipelineName=lp.cfg.pipeline_name)
+    _state.update({"mock": mock, "lp": lp, "default_user": APPROVER, "active_run": None,
+                   "pipeline_desc": desc, "pipeline_view": _definition_view(desc["PipelineDefinition"])})
+
+
+def _snapshot(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy run records that a training thread may be updating."""
+    for _ in range(5):
+        try:
+            return json.loads(json.dumps(runs, default=str))
+        except RuntimeError:
+            continue
+    return []
+
+
+def _train_in_background(lp: Any, run_id: str, submitted_by: str, shuffle: bool) -> None:
+    try:
+        with _lock:
+            lp.train_and_register(rows=3000, seed=random.randint(10, 10_000), submitted_by=submitted_by,
+                                  shuffle_labels=shuffle, run_id=run_id)
+    except Exception as exc:  # recorded on the run as a Failed step
+        print(f"training run {run_id} failed: {exc}", file=sys.stderr)
+    finally:
+        _state["active_run"] = None
 
 
 # ----- remote mode -------------------------------------------------------------------------
@@ -387,21 +413,24 @@ def decision(req: Decision, x_console_user: Optional[str] = Header(default=None)
 
 @app.get("/api/pipeline")
 def pipeline() -> dict[str, Any]:
+    if MODE == "local":
+        # No _lock: polled while a training thread holds it; reads only the cached definition and run copies.
+        lp = _local()
+        desc = _state["pipeline_desc"]
+        return {"name": lp.cfg.pipeline_name, "arn": desc.get("PipelineArn"), "role_arn": desc.get("RoleArn"),
+                **_state["pipeline_view"], "runs": _snapshot(lp.runs), "active_run_id": _state["active_run"]}
     with _lock:
-        if MODE == "local":
-            lp = _local()
-            sm, name, runs = lp.sm, lp.cfg.pipeline_name, lp.runs
-        else:
-            sm, _ = _remote_clients()
-            name = os.environ.get("MLP_PIPELINE_NAME")
-            if not name:
-                from ml_platform.config import ModelConfig
+        sm, _ = _remote_clients()
+        name = os.environ.get("MLP_PIPELINE_NAME")
+        if not name:
+            from ml_platform.config import ModelConfig
 
-                name = ModelConfig.load(str(ROOT / "model.yaml")).pipeline_name
-            runs = _remote_runs(sm, name)
+            name = ModelConfig.load(str(ROOT / "model.yaml")).pipeline_name
+        runs = _remote_runs(sm, name)
         desc = sm.describe_pipeline(PipelineName=name)
+        active = next((r["run_id"] for r in runs if r["status"] == "Executing"), None)
         return {"name": name, "arn": desc.get("PipelineArn"), "role_arn": desc.get("RoleArn"),
-                **_definition_view(desc["PipelineDefinition"]), "runs": runs}
+                **_definition_view(desc["PipelineDefinition"]), "runs": runs, "active_run_id": active}
 
 
 @app.post("/api/simulate/train")
@@ -409,6 +438,7 @@ def simulate_train(req: Optional[TrainRequest] = None,
                    x_console_user: Optional[str] = Header(default=None)) -> dict[str, Any]:
     if MODE != "local":
         raise HTTPException(404, "local mode only")
+    """Start a run in the background; follow it with GET /api/pipeline (run_id, active_run_id)."""
     shuffle = bool(req and req.shuffle_labels)
     with _lock:
         lp = _local()
@@ -416,11 +446,13 @@ def simulate_train(req: Optional[TrainRequest] = None,
         item = next((i for i in lp.identities() if i["pk"] == user), None)
         if not item or not _identity_view(item, lp.cfg.tenant_id)["can_train"]:
             raise HTTPException(403, f"{user} cannot start training for tenant {lp.cfg.tenant_id}")
-        result = lp.train_and_register(rows=3000, seed=random.randint(10, 10_000),
-                                       submitted_by=item.get("github_login") or user, shuffle_labels=shuffle)
-    return {"registered": result.get("registered"), "metrics": result.get("metrics"),
-            "passed": result.get("passed"), "registration": result.get("registration"),
-            "execution_arn": result.get("execution_arn")}
+        if _state["active_run"]:
+            raise HTTPException(409, "a training run is already in progress")
+        run_id = uuid.uuid4().hex
+        _state["active_run"] = run_id
+    threading.Thread(target=_train_in_background, daemon=True,
+                     args=(lp, run_id, item.get("github_login") or user, shuffle)).start()
+    return {"run_id": run_id}
 
 
 @app.post("/api/simulate/console-approve")

@@ -83,11 +83,18 @@ def _now() -> str:
 
 
 @contextlib.contextmanager
-def _timed_step(run: dict[str, Any], name: str, kind: str, step_type: str) -> Iterator[dict[str, Any]]:
-    """Append a step record to `run`; it ends Succeeded unless the body sets another status or raises."""
+def _timed_step(run: dict[str, Any], name: str, kind: str, step_type: str,
+                pace_s: float = 0.0) -> Iterator[dict[str, Any]]:
+    """Append a step record to `run`; it ends Succeeded unless the body sets another status or raises.
+
+    pace_s holds the step in Executing before it runs (not counted in duration) so a live view
+    can follow fast local steps.
+    """
     step = {"name": name, "kind": kind, "type": step_type, "status": "Executing", "started_at": _now(),
             "duration_ms": None, "detail": "", "outputs": {}}
     run["steps"].append(step)
+    if pace_s:
+        time.sleep(pace_s)
     start = time.perf_counter()
     try:
         yield step
@@ -135,6 +142,7 @@ class LocalPlatform:
         self.ddb = boto3.resource("dynamodb", region_name=self.region)
         self._handlers: dict[str, Any] = {}
         self.runs: list[dict[str, Any]] = []
+        self.step_pace_s = 0.0
 
     # ----- setup -------------------------------------------------------------------------
     def bootstrap(self) -> None:
@@ -171,6 +179,9 @@ class LocalPlatform:
             self._handlers[name] = _load_handler(name)
         return self._handlers[name]
 
+    def _step(self, run: dict[str, Any], name: str, kind: str, step_type: str):
+        return _timed_step(run, name, kind, step_type, self.step_pace_s)
+
     def identities(self) -> list[dict[str, Any]]:
         return self.ddb.Table(self.tables["identity"]).scan()["Items"]
 
@@ -185,17 +196,20 @@ class LocalPlatform:
         return f"{self.account}.dkr.ecr.{self.region}.amazonaws.com/{self.ecr_repo}@{image['image']['imageId']['imageDigest']}"
 
     def run_pipeline(self, rows: int = 5000, seed: int = 1, commit: str | None = None,
-                     submitted_by: str = SUBMITTER_GITHUB, log=print, shuffle_labels: bool = False) -> dict[str, Any]:
+                     submitted_by: str = SUBMITTER_GITHUB, log=print, shuffle_labels: bool = False,
+                     run_id: str | None = None) -> dict[str, Any]:
         """Image push, data upload, pipeline steps run locally, candidate publish. Returns run info.
 
-        Each step is recorded in `self.runs` (newest first). shuffle_labels trains on labels with no
-        signal so the CheckMetric gate fails.
+        Each step is recorded in `self.runs` (newest first) as it happens. shuffle_labels trains on
+        labels with no signal so the CheckMetric gate fails.
         """
         commit = commit or hashlib.sha1(uuid.uuid4().bytes).hexdigest()
-        run = {"execution_arn": None, "commit": commit, "submitted_by": submitted_by, "rows": rows,
-               "shuffle_labels": shuffle_labels, "started_at": _now(), "ended_at": None, "status": "Executing",
-               "gate": None, "thresholds": dict(self.cfg.thresholds), "metrics": {}, "parameters": {},
-               "steps": [], "model_package_arn": None}
+        # Every key exists from the start: readers may copy the record while the run updates it.
+        run = {"run_id": run_id or uuid.uuid4().hex, "execution_arn": None, "commit": commit,
+               "submitted_by": submitted_by, "rows": rows, "shuffle_labels": shuffle_labels, "image_uri": None,
+               "started_at": _now(), "ended_at": None, "status": "Executing", "gate": None,
+               "thresholds": dict(self.cfg.thresholds), "metrics": {}, "parameters": {}, "steps": [],
+               "model_package_arn": None}
         self.runs.insert(0, run)
         try:
             info = self._run_pipeline(run, rows, seed, commit, submitted_by, log, shuffle_labels)
@@ -211,13 +225,13 @@ class LocalPlatform:
                       log, shuffle_labels: bool) -> dict[str, Any]:
         cfg = self.cfg
         run_dir = self.work / commit[:12]
-        with _timed_step(run, "BuildImage", "ci", "GitHub Actions → ECR") as step:
+        with self._step(run, "BuildImage", "ci", "GitHub Actions → ECR") as step:
             image_uri = self.push_image(commit)
             step["outputs"] = {"image_uri": image_uri}
         log(f"image      {image_uri}")
 
         train_dir, eval_dir = run_dir / "train", run_dir / "validation"
-        with _timed_step(run, "UploadData", "ci", "S3") as step:
+        with self._step(run, "UploadData", "ci", "S3") as step:
             train_dir.mkdir(parents=True)
             eval_dir.mkdir()
             train = make_dataset(rows, seed=seed)
@@ -243,7 +257,7 @@ class LocalPlatform:
         staging_prefix = output_prefix.split(self.staging_bucket + "/", 1)[1]
         model_key = f"{staging_prefix}/model/train-job/output/model.tar.gz"
         packaged = run_dir / "packaged"
-        with _timed_step(run, "Train", "pipeline", "Training") as step:
+        with self._step(run, "Train", "pipeline", "Training") as step:
             _run_script("train.py", "--train", str(train_dir), "--model-dir", str(model_dir))
             packaged.mkdir()
             with tarfile.open(packaged / "model.tar.gz", "w:gz") as tar:
@@ -253,7 +267,7 @@ class LocalPlatform:
             step["outputs"] = {"model_artifact": f"s3://{self.staging_bucket}/{model_key}"}
         log("Train      model.tar.gz uploaded")
 
-        with _timed_step(run, "Evaluate", "pipeline", "Processing") as step:
+        with self._step(run, "Evaluate", "pipeline", "Processing") as step:
             _run_script("evaluate.py", "--model-dir", str(model_dir), "--input-dir", str(eval_dir),
                         "--output-dir", str(evaluation_dir))
             metrics = json.loads((evaluation_dir / "metrics.json").read_text())
@@ -261,7 +275,7 @@ class LocalPlatform:
         run["metrics"] = metrics
         log(f"Evaluate   auc={metrics['auc']:.4f} accuracy={metrics['accuracy']:.4f}")
 
-        with _timed_step(run, "CheckMetric", "pipeline", "Condition") as step:
+        with self._step(run, "CheckMetric", "pipeline", "Condition") as step:
             failed = {m: metrics.get(m) for m, t in cfg.thresholds.items() if metrics.get(m, -1) < t}
             step["outputs"] = {"outcome": "False" if failed else "True",
                                "conditions": [f"{m} >= {t}" for m, t in cfg.thresholds.items()]}
@@ -277,7 +291,7 @@ class LocalPlatform:
                                  "detail": "CheckMetric was False and the else branch is empty.", "outputs": {}})
             return info
 
-        with _timed_step(run, "PublishCandidate", "pipeline", "Processing") as step:
+        with self._step(run, "PublishCandidate", "pipeline", "Processing") as step:
             _run_script(str(PLATFORM / "ml_platform" / "scripts" / "publish_candidate.py"),
                         "--model-dir", str(packaged), "--evaluation-dir", str(evaluation_dir),
                         "--output-dir", str(candidate_dir),
@@ -306,7 +320,7 @@ class LocalPlatform:
         run = next((r for r in self.runs if r["execution_arn"] == execution_arn), None)
         if run is None or any(s["name"] == "RegisterCandidate" for s in run["steps"]):
             return invoke()
-        with _timed_step(run, "RegisterCandidate", "event", "EventBridge → Lambda") as step:
+        with self._step(run, "RegisterCandidate", "event", "EventBridge → Lambda") as step:
             result = invoke()
             code, body = result["statusCode"], result["body"]
             if code == 200:
@@ -319,9 +333,10 @@ class LocalPlatform:
         return result
 
     def train_and_register(self, rows: int = 5000, seed: int = 1, submitted_by: str = DATA_SCIENTIST_GITHUB,
-                           log=lambda *_: None, shuffle_labels: bool = False) -> dict[str, Any]:
+                           log=lambda *_: None, shuffle_labels: bool = False,
+                           run_id: str | None = None) -> dict[str, Any]:
         info = self.run_pipeline(rows=rows, seed=seed, submitted_by=submitted_by, log=log,
-                                 shuffle_labels=shuffle_labels)
+                                 shuffle_labels=shuffle_labels, run_id=run_id)
         reg = self.register(info["execution_arn"])
         if reg["statusCode"] != 200:
             return {**info, "registered": False}

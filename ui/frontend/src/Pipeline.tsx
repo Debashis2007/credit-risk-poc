@@ -1,7 +1,8 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { api, Package, Pipeline, PipelineRun, RunStep, Session, StepDef } from "./api";
+import { Package, Pipeline, PipelineRun, RunStep, Session, StepDef } from "./api";
 
 type Node = { name: string; type: string; def?: StepDef; label?: string };
+type Position = { node: string; text: string; tone: "live" | "wait" | "done" | "stop" };
 
 const STATUS_CLASS: Record<string, string> = {
   Succeeded: "ok", Failed: "bad", Executing: "running", Skipped: "skipped", NotExecuted: "skipped",
@@ -13,12 +14,54 @@ const execId = (arn?: string | null) => (arn ? arn.split("/").pop() : "—");
 const version = (arn?: string | null) => (arn ? arn.split("/").pop() : undefined);
 const show = (v: unknown) => (Array.isArray(v) ? v.join(", ") : typeof v === "object" && v ? JSON.stringify(v) : String(v));
 
+const CI_NODES: Node[] = [
+  { name: "BuildImage", type: "GitHub Actions → ECR", label: "Build image" },
+  { name: "UploadData", type: "S3", label: "Training data" },
+];
+const REGISTER_NODE: Node = { name: "RegisterCandidate", type: "EventBridge → Lambda", label: "Register candidate" };
+
 function runDuration(run: PipelineRun) {
   return run.steps.reduce((total, s) => total + (s.duration_ms ?? 0), 0);
 }
 
-function StepNode({ node, step, selected, onSelect }: {
-  node: Node; step?: RunStep; selected: boolean; onSelect: () => void;
+/** Where the flow stands for a run: the step executing now, or where it stopped or is waiting. */
+export function position(run: PipelineRun, order: Node[], live: boolean, pkg?: Package,
+  deployParameter?: string | null): Position {
+  const label = (name: string) => order.find((n) => n.name === name)?.label ?? name;
+  const failed = run.steps.find((s) => s.status === "Failed");
+  if (failed) return { node: failed.name, text: `Stopped: ${label(failed.name)} failed. ${failed.detail}`, tone: "stop" };
+  if (live) {
+    const executing = run.steps.find((s) => s.status === "Executing");
+    if (executing) return { node: executing.name, text: `Running ${label(executing.name)} (${executing.type})`, tone: "live" };
+    const next = order.find((n) => !run.steps.some((s) => s.name === n.name));
+    return { node: next?.name ?? "RegisterCandidate", text: `Starting ${label(next?.name ?? "RegisterCandidate")}`, tone: "live" };
+  }
+  if (run.gate === "failed") {
+    const gate = run.steps.find((s) => s.name === "CheckMetric");
+    return { node: "CheckMetric", text: `Stopped at the evaluation gate. ${gate?.detail ?? ""} No candidate was published.`, tone: "stop" };
+  }
+  if (run.model_package_arn && pkg) {
+    if (pkg.approval_status === "PendingManualApproval")
+      return { node: "Registry", text: `Waiting for a senior data scientist to approve v${pkg.version}.`, tone: "wait" };
+    if (pkg.approval_status === "Rejected")
+      return { node: "Registry", text: `v${pkg.version} was rejected.`, tone: "stop" };
+    if (deployParameter === pkg.model_package_arn)
+      return { node: "DeploySignal", text: `v${pkg.version} approved; deploy signal published.`, tone: "done" };
+    if (pkg.approved_outside_api)
+      return { node: "Registry", text: `v${pkg.version} approved outside the API; no deploy signal.`, tone: "stop" };
+    return { node: "Registry", text: `v${pkg.version} approved; a later version holds the deploy signal.`, tone: "done" };
+  }
+  const register = run.steps.find((s) => s.name === "RegisterCandidate");
+  if (register) return { node: "RegisterCandidate", text: `Registration ${register.status.toLowerCase()}. ${register.detail}`, tone: "stop" };
+  return { node: run.steps[run.steps.length - 1]?.name ?? "BuildImage", text: run.status, tone: "stop" };
+}
+
+function NowBadge({ pos }: { pos: Position }) {
+  return <span className={`now ${pos.tone}`}>{pos.tone === "live" ? "● Running" : pos.tone === "wait" ? "◆ Waiting" : pos.tone === "done" ? "✓ Done" : "■ Stopped"}</span>;
+}
+
+function StepNode({ node, step, selected, pos, onSelect }: {
+  node: Node; step?: RunStep; selected: boolean; pos?: Position; onSelect: () => void;
 }) {
   const outcome = step?.outputs.outcome as string | undefined;
   const cls = !step ? "idle" : outcome === "False" ? "bad" : STATUS_CLASS[step.status] ?? "";
@@ -26,8 +69,11 @@ function StepNode({ node, step, selected, onSelect }: {
     ? [outcome ? `${step.status}, ${outcome}` : step.status, step.duration_ms != null ? secs(step.duration_ms) : ""]
       .filter(Boolean).join(" · ")
     : "not run";
+  const here = pos?.node === node.name;
   return (
-    <button className={`node ${cls} ${selected ? "selected" : ""}`} onClick={onSelect} title={step?.detail || node.type}>
+    <button className={`node ${cls} ${selected ? "selected" : ""} ${here ? `current ${pos!.tone}` : ""}`}
+      onClick={onSelect} title={step?.detail || node.type}>
+      {here && <NowBadge pos={pos!} />}
       <span className="node-name">{node.label ?? node.name}</span>
       <span className="node-type">{node.type}</span>
       <span className="node-status">{status}</span>
@@ -35,8 +81,8 @@ function StepNode({ node, step, selected, onSelect }: {
   );
 }
 
-function Flow({ nodes, run, selected, onSelect }: {
-  nodes: Node[]; run?: PipelineRun; selected: string; onSelect: (n: string) => void;
+function Flow({ nodes, run, selected, pos, onSelect }: {
+  nodes: Node[]; run?: PipelineRun; selected: string; pos?: Position; onSelect: (n: string) => void;
 }) {
   return (
     <div className="flow">
@@ -44,7 +90,7 @@ function Flow({ nodes, run, selected, onSelect }: {
         <Fragment key={n.name}>
           {i > 0 && <span className={`arrow ${n.def?.branch ? "branch" : ""}`}>{n.def?.branch === "if" ? "True →" : n.def?.branch === "else" ? "False →" : "→"}</span>}
           <StepNode node={n} step={run?.steps.find((s) => s.name === n.name)} selected={selected === n.name}
-            onSelect={() => onSelect(n.name)} />
+            pos={pos} onSelect={() => onSelect(n.name)} />
         </Fragment>
       ))}
     </div>
@@ -52,52 +98,48 @@ function Flow({ nodes, run, selected, onSelect }: {
 }
 
 export default function PipelineView({
-  session, packages, refreshKey, training, focusCommit, onTrain, onOpenPackage, onError,
+  session, pipeline, packages, focusCommit, followRunId, onTrain, onOpenPackage,
 }: {
   session: Session;
+  pipeline: Pipeline | null;
   packages: Package[];
-  refreshKey: number;
-  training: boolean;
   focusCommit: string | null;
-  onTrain: (shuffleLabels: boolean) => Promise<string | undefined>;
+  followRunId: string | null;
+  onTrain: (shuffleLabels: boolean) => void;
   onOpenPackage: (arn: string) => void;
-  onError: (text: string) => void;
 }) {
-  const [pipeline, setPipeline] = useState<Pipeline | null>(null);
-  const [runArn, setRunArn] = useState<string | null>(null);
-  const [stepName, setStepName] = useState("Train");
+  const [runId, setRunId] = useState<string | null>(null);
+  const [stepName, setStepName] = useState<string | null>(null);
+  const runs = pipeline?.runs ?? [];
 
   useEffect(() => {
-    api.pipeline().then((p) => {
-      setPipeline(p);
-      const focused = focusCommit ? p.runs.find((r) => r.commit === focusCommit)?.execution_arn : undefined;
-      setRunArn((cur) => focused ?? (cur && p.runs.some((r) => r.execution_arn === cur) ? cur : p.runs[0]?.execution_arn ?? null));
-    }).catch((e) => onError(e.message));
-  }, [refreshKey, focusCommit, onError]);
+    if (followRunId && runs.some((r) => r.run_id === followRunId)) setRunId(followRunId);
+  }, [followRunId, runs]);
+  useEffect(() => {
+    const focused = focusCommit ? runs.find((r) => r.commit === focusCommit)?.run_id : undefined;
+    setRunId((cur) => focused ?? (cur && runs.some((r) => r.run_id === cur) ? cur : runs[0]?.run_id ?? null));
+  }, [focusCommit, runs.length]);
 
-  const run = pipeline?.runs.find((r) => r.execution_arn === runArn);
-  const pkg = packages.find((p) => p.model_package_arn === run?.model_package_arn);
   const pipelineNodes = useMemo<Node[]>(
     () => (pipeline?.steps ?? []).filter((s) => s.branch !== "else").map((s) => ({ name: s.name, type: s.type, def: s })),
     [pipeline],
   );
   if (!pipeline) return <div className="detail muted">Loading pipeline…</div>;
 
-  const ciNodes: Node[] = [
-    { name: "BuildImage", type: "GitHub Actions → ECR", label: "Build image" },
-    { name: "UploadData", type: "S3", label: "Training data" },
-  ];
-  const eventNodes: Node[] = [{ name: "RegisterCandidate", type: "EventBridge → Lambda", label: "Register candidate" }];
-  const allNodes = [...ciNodes, ...pipelineNodes, ...eventNodes];
-  const node = allNodes.find((n) => n.name === stepName) ?? allNodes[0];
+  const run = runs.find((r) => r.run_id === runId);
+  const live = !!run && run.run_id === pipeline.active_run_id;
+  const busy = !!pipeline.active_run_id;
+  const pkg = packages.find((p) => p.model_package_arn === run?.model_package_arn);
+  const order = [...CI_NODES, ...pipelineNodes, REGISTER_NODE];
+  const pos = run ? position(run, order, live, pkg, session.deploy_parameter) : undefined;
+  const allNodes = [...order, { name: "Registry", type: "Model package" }, { name: "DeploySignal", type: "SSM parameter" }];
+  const node = allNodes.find((n) => n.name === (stepName ?? (live ? pos?.node : null))) ?? allNodes.find((n) => n.name === pos?.node) ?? allNodes[0];
   const step = run?.steps.find((s) => s.name === node.name);
   const deployed = session.deploy_parameter && session.deploy_parameter === run?.model_package_arn;
   const elseSteps = pipeline.steps.filter((s) => s.branch === "else");
-
-  const start = async (shuffle: boolean) => {
-    const arn = await onTrain(shuffle);
-    if (arn) setRunArn(arn);
-  };
+  const done = run ? run.steps.filter((s) => s.status !== "Executing").length : 0;
+  const pending = busy && !runs.some((r) => r.run_id === pipeline.active_run_id);
+  const nodeProps = { run, pos, selected: node.name, onSelect: setStepName };
 
   return (
     <div className="detail">
@@ -108,10 +150,10 @@ export default function PipelineView({
         </div>
         {session.mode === "local" && (
           <div className="actions">
-            <button className="primary" disabled={training || !session.me?.can_train} onClick={() => start(false)}>
-              {training ? "Running…" : "Start run"}
+            <button className="primary" disabled={busy || !session.me?.can_train} onClick={() => { setStepName(null); onTrain(false); }}>
+              {busy ? "Run in progress…" : "Start run"}
             </button>
-            <button className="ghost" disabled={training || !session.me?.can_train} onClick={() => start(true)}
+            <button className="ghost" disabled={busy || !session.me?.can_train} onClick={() => { setStepName(null); onTrain(true); }}
               title="Trains on shuffled labels, so the CheckMetric gate fails">
               Start run on shuffled labels
             </button>
@@ -122,20 +164,33 @@ export default function PipelineView({
         <div className="notice warn">Starting a run needs a data scientist role in tenant {session.tenant_id}.</div>
       )}
 
-      <section className="card">
-        <div className="card-head">
-          <h3>Flow</h3>
-          {run && <span className="muted small">execution <code>{execId(run.execution_arn)}</code> by {run.submitted_by}</span>}
+      {pending && <div className="where live"><NowBadge pos={{ node: "", text: "", tone: "live" }} /> Starting a new run…</div>}
+      {run && pos && (
+        <div className={`where ${pos.tone}`}>
+          <NowBadge pos={pos} />
+          <div className="where-text">
+            <b>Where it stands:</b> {pos.text}
+            <div className="muted small">
+              Execution <code>{execId(run.execution_arn)}</code> by {run.submitted_by} · started {when(run.started_at)}
+            </div>
+            {live && (
+              <div className="progress"><div style={{ width: `${Math.round((done / order.length) * 100)}%` }} /></div>
+            )}
+          </div>
         </div>
+      )}
+
+      <section className="card">
+        <h3>Flow</h3>
         <div className="lanes">
           <div className="lane">
             <div className="lane-title">CI</div>
-            <Flow nodes={ciNodes} run={run} selected={node.name} onSelect={setStepName} />
+            <Flow nodes={CI_NODES} {...nodeProps} />
           </div>
           <span className="arrow">→</span>
           <div className="lane sagemaker">
             <div className="lane-title">SageMaker pipeline (definition from the platform)</div>
-            <Flow nodes={pipelineNodes} run={run} selected={node.name} onSelect={setStepName} />
+            <Flow nodes={pipelineNodes} {...nodeProps} />
             <div className="muted small">
               CheckMetric False → {elseSteps.length ? elseSteps.map((s) => s.name).join(", ") : "end, no candidate published"}
             </div>
@@ -144,18 +199,20 @@ export default function PipelineView({
           <div className="lane">
             <div className="lane-title">Control plane</div>
             <div className="flow">
-              <StepNode node={eventNodes[0]} step={run?.steps.find((s) => s.name === "RegisterCandidate")}
-                selected={node.name === "RegisterCandidate"} onSelect={() => setStepName("RegisterCandidate")} />
+              <StepNode node={REGISTER_NODE} step={run?.steps.find((s) => s.name === "RegisterCandidate")}
+                selected={node.name === "RegisterCandidate"} pos={pos} onSelect={() => setStepName("RegisterCandidate")} />
               <span className="arrow">→</span>
-              <button className={`node ${pkg ? (pkg.approval_status === "Approved" ? "ok" : pkg.approval_status === "Rejected" ? "skipped" : "running") : "idle"}`}
+              <button className={`node ${pkg ? (pkg.approval_status === "Approved" ? "ok" : pkg.approval_status === "Rejected" ? "skipped" : "running") : "idle"} ${pos?.node === "Registry" ? `current ${pos.tone}` : ""}`}
                 disabled={!pkg} onClick={() => pkg && onOpenPackage(pkg.model_package_arn)}
                 title={pkg ? "Open in approvals" : "No package registered"}>
+                {pos?.node === "Registry" && <NowBadge pos={pos} />}
                 <span className="node-name">Registry {pkg ? `v${pkg.version}` : ""}</span>
                 <span className="node-type">Model package</span>
                 <span className="node-status">{pkg ? (pkg.approval_status === "PendingManualApproval" ? "Pending approval" : pkg.approval_status) : "none"}</span>
               </button>
               <span className="arrow">→</span>
-              <div className={`node static ${deployed ? "ok" : "idle"}`}>
+              <div className={`node static ${deployed ? "ok" : "idle"} ${pos?.node === "DeploySignal" ? `current ${pos.tone}` : ""}`}>
+                {pos?.node === "DeploySignal" && <NowBadge pos={pos} />}
                 <span className="node-name">Deploy signal</span>
                 <span className="node-type">SSM parameter</span>
                 <span className="node-status">{deployed ? "Published" : "Not published"}</span>
@@ -186,35 +243,36 @@ export default function PipelineView({
         </section>
         <section className="card">
           <h3>Execution parameters</h3>
-          {run ? (
+          {run && Object.keys(run.parameters).length ? (
             <dl>
               {pipeline.parameters.map((p) => (
                 <Fragment key={p.name}><dt>{p.name}</dt><dd className="small">{run.parameters[p.name] || <span className="muted">(empty)</span>}</dd></Fragment>
               ))}
             </dl>
-          ) : <p className="muted small">No executions yet.</p>}
+          ) : <p className="muted small">{run ? "Set when the pipeline execution starts." : "No executions yet."}</p>}
         </section>
       </div>
 
       <section className="card">
         <h3>Executions</h3>
-        {pipeline.runs.length ? (
+        {runs.length ? (
           <table className="runs">
             <thead>
               <tr><th>Started</th><th>Execution</th><th>Submitted by</th><th>Commit</th><th>AUC</th><th>Gate</th><th>Result</th><th>Time</th></tr>
             </thead>
             <tbody>
-              {pipeline.runs.map((r) => {
+              {runs.map((r) => {
                 const v = version(r.model_package_arn);
+                const rowLive = r.run_id === pipeline.active_run_id;
                 return (
-                  <tr key={r.execution_arn ?? r.started_at} className={r.execution_arn === runArn ? "active" : ""}
-                    onClick={() => setRunArn(r.execution_arn)}>
+                  <tr key={r.run_id} className={r.run_id === runId ? "active" : ""}
+                    onClick={() => { setRunId(r.run_id); setStepName(null); }}>
                     <td>{when(r.started_at)}</td>
                     <td><code>{execId(r.execution_arn)}</code></td>
                     <td>{r.submitted_by ?? "—"}</td>
                     <td><code>{short(r.commit, 8)}</code>{r.shuffle_labels && <span className="pill rejected">shuffled labels</span>}</td>
                     <td>{r.metrics.auc !== undefined ? r.metrics.auc.toFixed(3) : "—"}</td>
-                    <td>{r.gate ? <span className={`status ${r.gate === "passed" ? "ok" : "bad"}`}>{r.gate}</span> : r.status}</td>
+                    <td>{rowLive ? <span className="status running">running</span> : r.gate ? <span className={`status ${r.gate === "passed" ? "ok" : "bad"}`}>{r.gate}</span> : r.status}</td>
                     <td>{v ? `package v${v}` : r.gate === "failed" ? "no candidate" : "—"}</td>
                     <td>{secs(runDuration(r))}</td>
                   </tr>

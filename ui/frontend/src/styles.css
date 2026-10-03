@@ -130,6 +130,27 @@ button.link { background: none; border: none; padding: 0; color: var(--brand); f
 .node.bad { border-left-color: var(--bad); } .node.bad .node-status { color: var(--bad); }
 .node.running { border-left-color: var(--warn); } .node.running .node-status { color: var(--warn); }
 .node.skipped, .node.idle { border-left-color: #c7ccd6; background: #fafbfc; } .node.skipped .node-status, .node.idle .node-status { color: var(--muted); }
+.node { position: relative; }
+.node.current { border-width: 2px; border-left-width: 6px; transform: translateY(-1px); }
+.node.current.live { border-color: var(--warn); background: var(--warn-bg); animation: pulse 1.2s ease-in-out infinite; }
+.node.current.wait { border-color: var(--brand); background: #eef2fd; box-shadow: 0 0 0 4px rgba(52, 86, 209, 0.15); }
+.node.current.done { border-color: var(--ok); background: var(--ok-bg); box-shadow: 0 0 0 4px rgba(24, 128, 74, 0.15); }
+.node.current.stop { border-color: var(--bad); background: var(--bad-bg); box-shadow: 0 0 0 4px rgba(196, 61, 61, 0.15); }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(154, 98, 0, 0.45); }
+  50% { box-shadow: 0 0 0 8px rgba(154, 98, 0, 0); }
+}
+.now { position: absolute; top: -10px; right: 8px; font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 999px; color: #fff; white-space: nowrap; }
+.where .now { position: static; font-size: 11px; padding: 3px 9px; }
+.now.live { background: var(--warn); } .now.wait { background: var(--brand); } .now.done { background: var(--ok); } .now.stop { background: var(--bad); }
+.where { display: flex; gap: 12px; align-items: flex-start; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--panel); font-size: 14px; }
+.where.live { border-color: var(--warn); background: var(--warn-bg); }
+.where.wait { border-color: #c9d3f5; background: #f1f4fd; }
+.where.done { border-color: var(--ok); background: var(--ok-bg); }
+.where.stop { border-color: #efc3c3; background: var(--bad-bg); }
+.where-text { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.progress { height: 6px; border-radius: 3px; background: rgba(0, 0, 0, 0.08); overflow: hidden; }
+.progress div { height: 100%; background: var(--warn); transition: width 0.4s ease; }
 .status { font-weight: 600; }
 .status.ok { color: var(--ok); } .status.bad { color: var(--bad); } .status.skipped { color: var(--muted); } .status.running { color: var(--warn); }
 

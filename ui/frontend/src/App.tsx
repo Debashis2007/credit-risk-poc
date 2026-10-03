@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError, auth, Identity, Package, Session } from "./api";
+import { api, ApiError, auth, Identity, Package, Pipeline, Session } from "./api";
 import PipelineView from "./Pipeline";
 
 type Notice = { kind: "ok" | "error" | "warn"; text: string } | null;
@@ -240,8 +240,6 @@ export default function App() {
   const [focusCommit, setFocusCommit] = useState<string | null>(null);
   const openPipeline = useCallback((commit?: string) => { setFocusCommit(commit ?? null); setTab("pipeline"); }, []);
   const openPackage = useCallback((arn: string) => { setSelected(arn); setTab("approvals"); }, []);
-  const onError = useCallback((text: string) => setNotice({ kind: "error", text }), []);
-
   const load = useCallback(async () => {
     try {
       let [s, p] = await Promise.all([api.session(), api.packages()]);
@@ -262,22 +260,45 @@ export default function App() {
   const refresh = useCallback(() => { setRefreshKey((k) => k + 1); load(); }, [load]);
   const pending = useMemo(() => packages.filter((p) => p.approval_status === "PendingManualApproval").length, [packages]);
 
-  const simulateTrain = async (shuffleLabels = false): Promise<string | undefined> => {
+  const [pipeline, setPipeline] = useState<Pipeline | null>(null);
+  const [watchRunId, setWatchRunId] = useState<string | null>(null);
+  const loadPipeline = useCallback(
+    () => api.pipeline().then(setPipeline).catch((e) => setNotice({ kind: "error", text: (e as Error).message })),
+    [],
+  );
+  useEffect(() => { if (tab === "pipeline" || watchRunId) loadPipeline(); }, [tab, refreshKey, watchRunId, loadPipeline]);
+  useEffect(() => {
+    if (!pipeline?.active_run_id && !watchRunId) return;
+    const timer = setTimeout(loadPipeline, 600);
+    return () => clearTimeout(timer);
+  }, [pipeline, watchRunId, loadPipeline]);
+
+  useEffect(() => {
+    if (!watchRunId || !pipeline || pipeline.active_run_id === watchRunId) return;
+    const run = pipeline.runs.find((r) => r.run_id === watchRunId);
+    if (!run) return;
+    const auc = run.metrics.auc !== undefined ? ` (auc ${run.metrics.auc.toFixed(4)})` : "";
+    setNotice(run.model_package_arn
+      ? { kind: "ok", text: `Run by ${run.submitted_by} passed${auc}; v${run.model_package_arn.split("/").pop()} registered and waiting for approval.` }
+      : run.gate === "failed"
+        ? { kind: "warn", text: `Run by ${run.submitted_by} stopped at the evaluation gate${auc}; nothing registered.` }
+        : { kind: "error", text: `Run by ${run.submitted_by} did not complete (${run.status}).` });
+    setWatchRunId(null);
+    setTraining(false);
+    setSelected(null);
+    load();
+  }, [pipeline, watchRunId, load]);
+
+  const simulateTrain = async (shuffleLabels = false) => {
     setTraining(true);
     setFocusCommit(null);
     try {
       const r = await api.simulateTrain(shuffleLabels);
-      const by = session?.me?.github_login ?? session?.user;
-      setNotice(r.registered
-        ? { kind: "ok", text: `Training run by ${by} passed (auc ${r.metrics.auc.toFixed(4)}); new candidate registered as PendingManualApproval.` }
-        : { kind: "warn", text: `Training run by ${by} failed the evaluation gate (auc ${r.metrics.auc.toFixed(4)}); nothing registered.` });
-      setSelected(null);
-      setRefreshKey((k) => k + 1);
-      await load();
-      return r.execution_arn;
+      setWatchRunId(r.run_id);
+      setNotice(null);
+      setTab("pipeline");
     } catch (e) {
       setNotice({ kind: "error", text: (e as Error).message });
-    } finally {
       setTraining(false);
     }
   };
@@ -331,8 +352,8 @@ export default function App() {
 
       {tab === "pipeline" ? (
         <main className="layout single">
-          <PipelineView session={session} packages={packages} refreshKey={refreshKey} training={training}
-            focusCommit={focusCommit} onTrain={simulateTrain} onOpenPackage={openPackage} onError={onError} />
+          <PipelineView session={session} pipeline={pipeline} packages={packages} focusCommit={focusCommit}
+            followRunId={watchRunId} onTrain={simulateTrain} onOpenPackage={openPackage} />
         </main>
       ) : (
       <main className="layout">
