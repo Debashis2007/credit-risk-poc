@@ -124,6 +124,7 @@ array, or `MLP_MODELS_FILE`). Each entry:
 | `thresholds` | `{metric: minimum}` checked before approval |
 | `features` | `[{name, label, hint, step}]` in the order the model expects; the Test endpoint form |
 | `presets`, `outcome` | example inputs for the form, and labels for the prediction (`positive`, `negative`, `score`) |
+| `github` | optional `{repo, workflow, branch}` for the **GitHub** tab: recent GitHub Actions runs, a red badge when the newest finished run failed, the failed job and step, and the error lines from its log |
 
 To add a model: create its pipeline (registering into its group with `ModelMetrics`) and add an
 entry. The console refuses packages from other groups on a model's routes. Then extend the console's
@@ -148,6 +149,7 @@ users. Configure each deployment with its own values, never shared with other pr
 | `MLP_ENDPOINT_REGION` | endpoint region, default `us-east-1` |
 | `MLP_ENDPOINT_AWS_ACCESS_KEY_ID` / `MLP_ENDPOINT_AWS_SECRET_ACCESS_KEY` | key for an IAM user allowed only `sagemaker:InvokeEndpoint` and `DescribeEndpoint` on the catalog's endpoints, plus `DescribeEndpointConfig` and `DescribeModel` on their configs and models |
 | `MLP_MODELS` / `MLP_MODELS_FILE` | optional model catalog override (see Model catalog) |
+| `MLP_GITHUB_TOKEN` | optional fine-grained GitHub token, read-only **Actions** and **Metadata** on the model repos; needed for error logs in the GitHub tab (without it, public repos still list runs, at 60 GitHub API requests an hour) |
 | `CONSOLE_ROLES` | aws mode: `user:role` entries, comma-separated |
 
 The **Test endpoint** tab calls the selected model's real endpoint in every console mode; local mode

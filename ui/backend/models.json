@@ -21,6 +21,7 @@
       "Safe applicant": {"income": 95000, "debt_to_income": 0.12, "credit_utilization": 0.08, "late_payments_12m": 0,
                          "credit_history_years": 18, "loan_amount": 6000, "open_accounts": 4}
     },
-    "outcome": {"positive": "Likely to default", "negative": "Unlikely to default", "score": "Default probability"}
+    "outcome": {"positive": "Likely to default", "negative": "Unlikely to default", "score": "Default probability"},
+    "github": {"repo": "Debashis2007/credit-risk-poc", "workflow": "ml-lifecycle.yml"}
   }
 ]

@@ -1,8 +1,9 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
-  api, ApiError, auth, Identity, login, LoginState, Package, Pipeline, Session, setUnauthorizedHandler,
+  api, ApiError, auth, GitHubSummary, Identity, login, LoginState, Package, Pipeline, Session, setUnauthorizedHandler,
 } from "./api";
 import EndpointView from "./Endpoint";
+import GitHubView from "./GitHub";
 import PipelineView from "./Pipeline";
 
 type Notice = { kind: "ok" | "error" | "warn"; text: string } | null;
@@ -302,7 +303,13 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
   const [refreshKey, setRefreshKey] = useState(0);
   const [training, setTraining] = useState(false);
   const [token, setToken] = useState(auth.token());
-  const [tab, setTab] = useState<"approvals" | "pipeline" | "endpoint">("approvals");
+  const [tab, setTab] = useState<"approvals" | "pipeline" | "endpoint" | "github">("approvals");
+  const [github, setGithub] = useState<GitHubSummary | null>(null);
+  const [githubError, setGithubError] = useState<string | null>(null);
+  const loadGithub = useCallback(() => {
+    setGithubError(null);
+    api.github().then(setGithub).catch((e) => setGithubError((e as Error).message));
+  }, []);
   const [focusCommit, setFocusCommit] = useState<string | null>(null);
   const openPipeline = useCallback((commit?: string) => { setFocusCommit(commit ?? null); setTab("pipeline"); }, []);
   const openPackage = useCallback((arn: string) => { setSelected(arn); setTab("approvals"); }, []);
@@ -324,8 +331,8 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
-  const refresh = useCallback(() => { setRefreshKey((k) => k + 1); load(); }, [load]);
+  useEffect(() => { load().then(loadGithub); }, [load, loadGithub]);
+  const refresh = useCallback(() => { setRefreshKey((k) => k + 1); load().then(loadGithub); }, [load, loadGithub]);
   const pending = useMemo(() => packages.filter((p) => p.approval_status === "PendingManualApproval").length, [packages]);
 
   const [pipeline, setPipeline] = useState<Pipeline | null>(null);
@@ -342,6 +349,7 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
     setTraining(false);
     setFocusCommit(null);
     setNotice(null);
+    setGithub(null);
     refresh();
   };
   useEffect(() => { if (tab === "pipeline" || watchRunId) loadPipeline(); }, [tab, refreshKey, watchRunId, loadPipeline]);
@@ -457,9 +465,16 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
         <button className={tab === "endpoint" ? "active" : ""} onClick={() => setTab("endpoint")}>
           Test endpoint
         </button>
+        <button className={tab === "github" ? "active" : ""} onClick={() => { setTab("github"); loadGithub(); }}>
+          GitHub {github?.alert && <span className="count bad" title="Latest run failed">!</span>}
+        </button>
       </nav>
 
-      {tab === "endpoint" ? (
+      {tab === "github" ? (
+        <main className="layout single">
+          <GitHubView key={session.model} summary={github} error={githubError} onRefresh={loadGithub} />
+        </main>
+      ) : tab === "endpoint" ? (
         <main className="layout single">
           <EndpointView key={session.model} />
         </main>

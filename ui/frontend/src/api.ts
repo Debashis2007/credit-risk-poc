@@ -128,6 +128,21 @@ export type ScoreResult = {
   results: { prediction: number; score: number | null }[];
 };
 
+export type GhRun = {
+  id: number; number: number; title: string; sha: string; branch: string; event: string; actor: string;
+  status: string; conclusion: string | null; started_at: string; updated_at: string; url: string; attempt: number;
+};
+export type GhStep = { number: number; name: string; status: string; conclusion: string | null };
+export type GhJob = {
+  id: number; name: string; status: string; conclusion: string | null; started_at: string | null;
+  completed_at: string | null; url: string; failed_step: string | null; steps: GhStep[];
+};
+export type GitHubSummary = {
+  configured: boolean; model: string; repo?: string; workflow?: string; branch?: string; authenticated?: boolean;
+  url?: string; runs?: GhRun[]; alert?: { run: GhRun; jobs: GhJob[] } | null; active?: boolean;
+};
+export type GhLog = { lines: { text: string; error: boolean; gap: boolean }[]; errors: number; truncated: boolean; total_lines: number };
+
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -191,6 +206,9 @@ export const api = {
     ),
   pipeline: () => request<Pipeline>("GET", "/api/pipeline"),
   endpoint: () => request<EndpointStatus>("GET", "/api/endpoint"),
+  github: () => request<GitHubSummary>("GET", "/api/github"),
+  githubRun: (runId: number) => request<{ run: GhRun; jobs: GhJob[] }>("GET", `/api/github/run?run_id=${runId}`),
+  githubLog: (jobId: number) => request<GhLog>("GET", `/api/github/log?job_id=${jobId}`),
   score: (applicants: Record<string, number>[]) =>
     request<ScoreResult>("POST", "/api/endpoint/score", { applicants }),
   train: () => request<{ run_id: string }>("POST", "/api/train"),

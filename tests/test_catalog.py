@@ -25,6 +25,7 @@ def test_default_catalog_is_the_credit_risk_poc():
     assert m.thresholds == {"auc": 0.75}
     assert m.feature_names[0] == "income" and len(m.feature_names) == 7
     assert set(m.presets) == {"Risky applicant", "Safe applicant"}
+    assert m.github == {"repo": "Debashis2007/credit-risk-poc", "workflow": "ml-lifecycle.yml", "branch": ""}
 
 
 def test_minimal_entry_gets_defaults():
@@ -46,6 +47,8 @@ def test_file_source(tmp_path):
     ([{**ENTRY, "id": "Churn Model"}], "lowercase"),
     ([ENTRY, ENTRY], "unique"),
     ([{**ENTRY, "presets": {"x": {"a": 1}}}], "exactly the features"),
+    ([{**ENTRY, "github": {"repo": "not a repo", "workflow": "ci.yml"}}], "owner/name"),
+    ([{**ENTRY, "github": {"repo": "acme/churn", "workflow": "../../etc"}}], "workflow file name"),
 ])
 def test_invalid_catalogs_fail_at_startup(entries, message):
     with pytest.raises(ValueError, match=message):

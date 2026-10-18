@@ -7,7 +7,8 @@ Source, first match wins:
 
 Entry fields: id, name, model_package_group, pipeline, endpoint (optional), thresholds
 ({metric: minimum}), features ([{name, label, hint, step}], in the order the model expects),
-presets ({label: {feature: value}}), outcome ({positive, negative, score}).
+presets ({label: {feature: value}}), outcome ({positive, negative, score}), github (optional
+{repo: "owner/name", workflow: "file.yml", branch}) for the GitHub tab.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ class Model:
     features: list[dict[str, Any]]
     presets: dict[str, dict[str, float]] = field(default_factory=dict)
     outcome: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_OUTCOME))
+    github: Optional[dict[str, str]] = None
 
     @property
     def feature_names(self) -> list[str]:
@@ -41,7 +43,8 @@ class Model:
 
     def public(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name, "group": self.model_package_group,
-                "pipeline": self.pipeline, "endpoint": self.endpoint}
+                "pipeline": self.pipeline, "endpoint": self.endpoint,
+                "github": self.github["repo"] if self.github else None}
 
 
 def _model(entry: dict[str, Any]) -> Model:
@@ -57,12 +60,19 @@ def _model(entry: dict[str, Any]) -> Model:
     for label, values in (entry.get("presets") or {}).items():
         if sorted(values) != sorted(names):
             raise ValueError(f"model {entry['id']!r} preset {label!r} must set exactly the features {names}")
+    github = entry.get("github") or None
+    if github:
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+", github.get("repo", "")):
+            raise ValueError(f"model {entry['id']!r} github.repo must be owner/name")
+        if not re.fullmatch(r"[\w.-]+\.ya?ml", github.get("workflow", "")):
+            raise ValueError(f"model {entry['id']!r} github.workflow must be a workflow file name, e.g. ci.yml")
+        github = {"repo": github["repo"], "workflow": github["workflow"], "branch": github.get("branch") or ""}
     return Model(
         id=entry["id"], name=entry.get("name") or entry["id"], model_package_group=entry["model_package_group"],
         pipeline=entry["pipeline"], endpoint=entry.get("endpoint") or None,
         thresholds={k: float(v) for k, v in (entry.get("thresholds") or {}).items()}, features=features,
         presets={k: {f: float(v) for f, v in p.items()} for k, p in (entry.get("presets") or {}).items()},
-        outcome={**DEFAULT_OUTCOME, **(entry.get("outcome") or {})},
+        outcome={**DEFAULT_OUTCOME, **(entry.get("outcome") or {})}, github=github,
     )
 
 

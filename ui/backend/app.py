@@ -49,9 +49,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import catalog  # noqa: E402
 from auth import Auth, install  # noqa: E402
 from endpoint import Endpoint, EndpointError  # noqa: E402
+from github_ci import GitHubCI, GitHubError  # noqa: E402
 
 AUTH = Auth()
 MODELS = catalog.load()
+GITHUB = GitHubCI()
+FAILED = {"failure", "timed_out", "startup_failure"}
 app = FastAPI(title="ML Platform lifecycle console",
               **({"docs_url": None, "redoc_url": None, "openapi_url": None} if AUTH.enabled else {}))
 install(app, AUTH)
@@ -749,6 +752,59 @@ def endpoint_score(req: ScoreRequest, model: Optional[str] = None) -> dict[str, 
         raise HTTPException(422, str(exc))
     except EndpointError as exc:
         raise HTTPException(502, f"SageMaker: {exc}")
+
+
+def _github_error(exc: GitHubError) -> HTTPException:
+    return HTTPException(409 if exc.status == 401 else 502, f"GitHub: {exc}")
+
+
+@app.get("/api/github")
+def github_runs(model: Optional[str] = None) -> dict[str, Any]:
+    """Workflow runs of the model's repo; "alert" is the newest finished run when it failed."""
+    m = _model(model)
+    if not m.github:
+        return {"configured": False, "model": m.id}
+    gh = m.github
+    base = {"configured": True, "model": m.id, "repo": gh["repo"], "workflow": gh["workflow"], "branch": gh["branch"],
+            "authenticated": GITHUB.authenticated,
+            "url": f"https://github.com/{gh['repo']}/actions/workflows/{gh['workflow']}"}
+    try:
+        runs = GITHUB.runs(gh["repo"], gh["workflow"], gh["branch"] or None)
+        latest = next((r for r in runs if r["status"] == "completed"), None)
+        alert = None
+        if latest and latest["conclusion"] in FAILED:
+            failed_jobs = [j for j in GITHUB.jobs(gh["repo"], latest["id"], True) if j["conclusion"] in FAILED]
+            alert = {"run": latest, "jobs": failed_jobs}
+    except GitHubError as exc:
+        raise _github_error(exc)
+    return {**base, "runs": runs, "alert": alert, "active": any(r["status"] != "completed" for r in runs)}
+
+
+@app.get("/api/github/run")
+def github_run(run_id: int, model: Optional[str] = None) -> dict[str, Any]:
+    m = _model(model)
+    if not m.github:
+        raise HTTPException(404, f"{m.name} has no GitHub repository in the model catalog")
+    try:
+        run = next((r for r in GITHUB.runs(m.github["repo"], m.github["workflow"], m.github["branch"] or None)
+                    if r["id"] == run_id), None)
+        if not run:
+            raise HTTPException(404, f"run {run_id} is not one of {m.name}'s recent runs")
+        return {"run": run, "jobs": GITHUB.jobs(m.github["repo"], run_id, run["status"] == "completed")}
+    except GitHubError as exc:
+        raise _github_error(exc)
+
+
+@app.get("/api/github/log")
+def github_log(job_id: int, model: Optional[str] = None) -> dict[str, Any]:
+    """Error lines of a job's log; the path is built from the catalog repo, so only that repo is readable."""
+    m = _model(model)
+    if not m.github:
+        raise HTTPException(404, f"{m.name} has no GitHub repository in the model catalog")
+    try:
+        return GITHUB.failure_log(m.github["repo"], job_id)
+    except GitHubError as exc:
+        raise _github_error(exc)
 
 
 if DIST.is_dir():
