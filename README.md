@@ -186,6 +186,7 @@ Failed logins are throttled (5 per 15 minutes per client). Without `CONSOLE_USER
 | Secret (`ml-nonprod`) | `MLP_GHA_PIPELINE_ROLE_ARN` | OIDC role in the control plane NonProd account (client-managed) |
 | Variable | `AWS_REGION` | `us-east-1` |
 | Variable | `MLP_ARTIFACTS_BUCKET` | Control plane artifacts bucket for pipeline staging output |
+| Variable | `MLP_TRAIN_ENABLED` | `true` to run the train job on pushes to `main`; leave unset until the secret and bucket above exist (tests still run on every push and PR) |
 | Variable (optional) | `MLP_PLATFORM_REF` | Platform branch or tag; defaults to `feature/v7-alignment` |
 | Variable (optional) | `MLP_MODEL_REPOSITORY_PREFIX` | ECR prefix; defaults to `ml-models` |
 

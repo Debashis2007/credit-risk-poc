@@ -43,7 +43,9 @@ jobs:
 
   train:
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Opt in with the repository variable MLP_TRAIN_ENABLED=true once the ml-nonprod environment has
+    # MLP_GHA_PIPELINE_ROLE_ARN and the MLP_ARTIFACTS_BUCKET variable is set.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.MLP_TRAIN_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: ml-nonprod
     steps:
