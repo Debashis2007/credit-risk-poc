@@ -369,7 +369,12 @@ def test_package_from_another_models_group_is_refused(aws):
 
 def test_endpoint_form_comes_from_the_catalog(aws):
     _, client = aws()
+    ep = console.Endpoint("churn-qa", ["tenure_months", "monthly_spend"],
+                          {"MLP_ENDPOINT_AWS_ACCESS_KEY_ID": "AKIA", "MLP_ENDPOINT_AWS_SECRET_ACCESS_KEY": "s"})
+    ep._send = lambda url, body, headers: (400, b'{"message": "Could not find endpoint \\"churn-qa\\"."}')
+    console._state["endpoints"]["churn"] = ep
     form = client.get("/api/endpoint", params={"model": "churn"}).json()
+    assert form["status"] == "NotDeployed"
     assert [f["name"] for f in form["features"]] == ["tenure_months", "monthly_spend"]
     assert form["name"] == "churn-qa" and form["model"] == "churn"
 

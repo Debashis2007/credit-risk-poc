@@ -57,6 +57,59 @@ def test_ignores_standard_aws_credentials():
     assert not make({"AWS_ACCESS_KEY_ID": "testing", "AWS_SECRET_ACCESS_KEY": "testing"}).configured
 
 
+@pytest.fixture
+def isolated_chain(monkeypatch):
+    """Default credential chain that sees only what a test sets: no profiles, files or instance metadata."""
+    for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
+        monkeypatch.delenv(key, raising=False)
+    for key in ("AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"):
+        monkeypatch.setenv(key, "/dev/null")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.delenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", raising=False)
+    return monkeypatch
+
+
+def signed_headers(ep: Endpoint, monkeypatch) -> dict[str, str]:
+    seen = {}
+
+    def urlopen(req, timeout):
+        seen.update({k.lower(): v for k, v in req.header_items()})
+        return io.BytesIO(json.dumps({"prediction": [0], "score": [0.1]}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", _as_response(urlopen))
+    ep.score([RISKY])
+    return seen
+
+
+def test_default_chain_signs_with_task_role_credentials(isolated_chain):
+    """On ECS the task role arrives as temporary credentials, including a session token."""
+    isolated_chain.setenv("AWS_ACCESS_KEY_ID", "ASIATASKROLE")
+    isolated_chain.setenv("AWS_SECRET_ACCESS_KEY", "s")
+    isolated_chain.setenv("AWS_SESSION_TOKEN", "tok")
+    ep = make({"AWS_REGION": "eu-west-1"}, features=FEATURES)
+    assert not ep.configured
+    ep = Endpoint("credit-risk-qa", FEATURES, {"AWS_REGION": "eu-west-1"}, default_credentials=True)
+    assert ep.configured and ep.region == "eu-west-1"
+    headers = signed_headers(ep, isolated_chain)
+    assert headers["authorization"].startswith("AWS4-HMAC-SHA256 Credential=ASIATASKROLE/")
+    assert "/eu-west-1/sagemaker/" in headers["authorization"]
+    assert headers["x-amz-security-token"] == "tok"
+
+
+def test_dedicated_keys_win_over_default_chain(isolated_chain):
+    isolated_chain.setenv("AWS_ACCESS_KEY_ID", "ASIATASKROLE")
+    isolated_chain.setenv("AWS_SECRET_ACCESS_KEY", "s")
+    ep = Endpoint("credit-risk-qa", FEATURES, ENV, default_credentials=True)
+    assert "Credential=AKIAEXAMPLE/" in signed_headers(ep, isolated_chain)["authorization"]
+
+
+def test_default_chain_without_credentials_explains(isolated_chain):
+    ep = Endpoint("credit-risk-qa", FEATURES, {}, default_credentials=True)
+    with pytest.raises(EndpointError, match="no AWS credentials") as exc:
+        ep.score([RISKY])
+    assert exc.value.status == 500
+
+
 def test_score_uses_the_models_own_feature_order():
     fake = FakeSageMaker({"Invoke": (200, {"prediction": [0], "score": [0.2]})})
     ep = make(name="churn-qa", features=["tenure_months", "monthly_spend"])

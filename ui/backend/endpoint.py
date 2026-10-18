@@ -1,9 +1,11 @@
 """Live SageMaker endpoint for the console's Test endpoint tab: status and scoring.
 
 The endpoint name and feature order come from the model catalog (catalog.py). Credentials, per deployment:
-  MLP_ENDPOINT_REGION                 default us-east-1
+  MLP_ENDPOINT_REGION                 default AWS_REGION, then us-east-1
   MLP_ENDPOINT_AWS_ACCESS_KEY_ID      key limited to Describe* and InvokeEndpoint on the catalog's endpoints
   MLP_ENDPOINT_AWS_SECRET_ACCESS_KEY
+Without those, and only when default_credentials is set (aws mode), the standard credential chain is
+used: an ECS task role, an instance profile, or AWS_* variables.
 
 Requests are signed here and sent with urllib instead of boto3: in local mode moto intercepts every
 botocore client and replaces AWS_* credentials with fakes, which would keep calls off the real account.
@@ -21,6 +23,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import botocore.session
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
@@ -35,18 +38,29 @@ class EndpointError(Exception):
 
 
 class Endpoint:
-    def __init__(self, name: Optional[str], features: list[str], env: Optional[dict[str, str]] = None):
+    def __init__(self, name: Optional[str], features: list[str], env: Optional[dict[str, str]] = None,
+                 default_credentials: bool = False):
         env = dict(os.environ if env is None else env)
         self.name = (name or "").strip()
         self.features = list(features)
-        self.region = env.get("MLP_ENDPOINT_REGION", "").strip() or "us-east-1"
+        self.region = (env.get("MLP_ENDPOINT_REGION", "").strip() or env.get("AWS_REGION", "").strip()
+                       or env.get("AWS_DEFAULT_REGION", "").strip() or "us-east-1")
         self._key = env.get("MLP_ENDPOINT_AWS_ACCESS_KEY_ID", "").strip()
         self._secret = env.get("MLP_ENDPOINT_AWS_SECRET_ACCESS_KEY", "").strip()
-        self.configured = bool(self.name and self._key and self._secret)
+        self._chain = botocore.session.get_session() if default_credentials and not (self._key and self._secret) else None
+        self.configured = bool(self.name and ((self._key and self._secret) or self._chain))
+
+    def _credentials(self) -> Any:
+        if self._key and self._secret:
+            return Credentials(self._key, self._secret)
+        creds = self._chain.get_credentials() if self._chain else None
+        if creds is None:
+            raise EndpointError(500, "no AWS credentials for the endpoint (task role, MLP_ENDPOINT_AWS_* or AWS_*)")
+        return creds.get_frozen_credentials()
 
     def _send(self, url: str, body: bytes, headers: dict[str, str]) -> tuple[int, bytes]:
         signed = AWSRequest(method="POST", url=url, data=body, headers=headers)
-        SigV4Auth(Credentials(self._key, self._secret), "sagemaker", self.region).add_auth(signed)
+        SigV4Auth(self._credentials(), "sagemaker", self.region).add_auth(signed)
         req = urllib.request.Request(url, data=body, method="POST", headers=dict(signed.headers.items()))
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:

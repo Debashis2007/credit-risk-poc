@@ -405,7 +405,7 @@ def _model(model_id: Optional[str], fallback: bool = False) -> catalog.Model:
 def _endpoint(m: catalog.Model) -> Endpoint:
     cache = _state.setdefault("endpoints", {})
     if m.id not in cache:
-        cache[m.id] = Endpoint(m.endpoint, m.feature_names)
+        cache[m.id] = Endpoint(m.endpoint, m.feature_names, default_credentials=MODE == "aws")
     return cache[m.id]
 
 

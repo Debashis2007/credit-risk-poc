@@ -108,14 +108,14 @@ start with a clear message when an entry is wrong.
 | `CONSOLE_SESSION_SECRET` | yes | At least 32 random characters: `python backend/auth.py secret` |
 | `CONSOLE_PROJECT` | yes | Short project name; part of the login cookie name, so consoles never share sessions |
 | `CONSOLE_ROLES` | yes | `username:senior_data_scientist` or `username:data_scientist`, comma-separated; unlisted users can only view |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | yes | Key for Approvals, Pipeline and deploys (IAM policy below) |
 | `AWS_REGION` | yes | Region of the SageMaker resources, e.g. `us-east-1` |
-| `MLP_ENDPOINT_AWS_ACCESS_KEY_ID`, `MLP_ENDPOINT_AWS_SECRET_ACCESS_KEY` | for Test endpoint | Key used to call endpoints; can be the same key |
-| `MLP_ENDPOINT_REGION` | no | Endpoint region; defaults to `us-east-1` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | only without an IAM role | Key with the IAM policy below. On ECS leave these out: the task role supplies credentials |
+| `MLP_ENDPOINT_AWS_ACCESS_KEY_ID`, `MLP_ENDPOINT_AWS_SECRET_ACCESS_KEY` | no | Separate key for Test endpoint; without it the console uses the same credentials as above (task role or `AWS_*`) |
+| `MLP_ENDPOINT_REGION` | no | Endpoint region; defaults to `AWS_REGION` |
 | `MLP_GITHUB_TOKEN` | for GitHub logs | Fine-grained token, repository permission **Actions: Read-only** on the model repos. Without it, public repos still list runs (60 GitHub requests an hour) and logs link to GitHub |
 | `CONSOLE_SESSION_HOURS` | no | Login lifetime; default 12 |
 | `MLP_MODELS` / `MLP_MODELS_FILE` | no | Catalog override (step 2) |
-| `PORT` | no | Listen port; default 8000 (Railway sets it) |
+| `PORT` | no | Listen port; default 8000 |
 
 The image sets `MLP_CONSOLE_MODE=aws` and `CONSOLE_AUTH_REQUIRED=1`, so it refuses to start
 without `CONSOLE_USERS` and `CONSOLE_SESSION_SECRET`.
@@ -191,21 +191,166 @@ docker run --rm -p 8000:8000 --env-file console.env lifecycle-console
 The image is about 300 MB: Node builds the frontend in a first stage; the final stage is Python 3.11
 slim with FastAPI, uvicorn and boto3, running as a non-root user.
 
-### Deploy on Railway
+### Deploy to Amazon ECS (Fargate)
 
-Add `railway.json` next to `Dockerfile.standalone` (if `ui/` is the repo root), or set the service's
-`RAILWAY_DOCKERFILE_PATH` to `ui/Dockerfile.standalone` and its root directory to `ui`:
+The console runs as one Fargate task behind an Application Load Balancer (ALB), in the same AWS
+account as the models. It needs no stored AWS keys: the **task role** carries the console's IAM
+policy, and logins and the GitHub token come from **Secrets Manager**.
+
+```
+browser ──HTTPS──▶ ALB (public subnets, ACM certificate)
+                     └──▶ Fargate task :8000 (private subnets) ──▶ SageMaker, S3, GitHub
+                            task role: console IAM policy
+                            secrets:   Secrets Manager
+                            logs:      CloudWatch /ecs/lifecycle-console
+```
+
+Replace `ACCOUNT`, `REGION`, subnet, security group, VPC and certificate IDs below. Run the commands
+from the `ui/` folder.
+
+**1. Push the image to ECR.** Fargate runs `linux/amd64` here, so build for it explicitly on Apple
+Silicon:
+
+```bash
+REGISTRY=ACCOUNT.dkr.ecr.REGION.amazonaws.com
+aws ecr create-repository --repository-name lifecycle-console --image-scanning-configuration scanOnPush=true
+aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+docker build --platform linux/amd64 -f Dockerfile.standalone -t "$REGISTRY/lifecycle-console:1" .
+docker push "$REGISTRY/lifecycle-console:1"
+```
+
+**2. Store the secrets.** One Secrets Manager secret holds the values that must not appear in the task
+definition:
+
+```bash
+cat > console-secrets.json <<'EOF'
+{"CONSOLE_USERS": "alice:pbkdf2_sha256$...,bob:pbkdf2_sha256$...",
+ "CONSOLE_SESSION_SECRET": "<python backend/auth.py secret>",
+ "MLP_GITHUB_TOKEN": "github_pat_..."}
+EOF
+aws secretsmanager create-secret --name lifecycle-console --secret-string file://console-secrets.json
+rm console-secrets.json
+```
+
+**3. Create the two IAM roles.** Both trust ECS tasks:
+
+```bash
+cat > ecs-trust.json <<'EOF'
+{"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+  "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+EOF
+
+# Execution role: lets ECS pull the image, write logs and read the secret at startup.
+aws iam create-role --role-name lifecycle-console-execution --assume-role-policy-document file://ecs-trust.json
+aws iam attach-role-policy --role-name lifecycle-console-execution \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws iam put-role-policy --role-name lifecycle-console-execution --policy-name read-console-secret \
+  --policy-document '{"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+    "Action": "secretsmanager:GetSecretValue",
+    "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:lifecycle-console-*"}]}'
+
+# Task role: what the console itself can do in AWS (the policy from step 3, saved as console-policy.json).
+aws iam create-role --role-name lifecycle-console-task --assume-role-policy-document file://ecs-trust.json
+aws iam create-policy --policy-name lifecycle-console --policy-document file://console-policy.json
+aws iam attach-role-policy --role-name lifecycle-console-task \
+  --policy-arn arn:aws:iam::ACCOUNT:policy/lifecycle-console
+```
+
+**4. Register the task definition.** Save as `taskdef.json`; non-secret settings go in `environment`,
+secrets are read from the secret's JSON keys:
 
 ```json
 {
-  "$schema": "https://railway.com/railway.schema.json",
-  "build": {"builder": "DOCKERFILE", "dockerfilePath": "Dockerfile.standalone"},
-  "deploy": {"healthcheckPath": "/api/health", "healthcheckTimeout": 300,
-             "restartPolicyType": "ON_FAILURE", "restartPolicyMaxRetries": 3}
+  "family": "lifecycle-console",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": {"operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64"},
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT:role/lifecycle-console-execution",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT:role/lifecycle-console-task",
+  "containerDefinitions": [{
+    "name": "console",
+    "image": "ACCOUNT.dkr.ecr.REGION.amazonaws.com/lifecycle-console:1",
+    "essential": true,
+    "portMappings": [{"containerPort": 8000, "protocol": "tcp"}],
+    "environment": [
+      {"name": "AWS_REGION", "value": "REGION"},
+      {"name": "CONSOLE_PROJECT", "value": "ml-console"},
+      {"name": "CONSOLE_ROLES", "value": "alice:senior_data_scientist,bob:data_scientist"}
+    ],
+    "secrets": [
+      {"name": "CONSOLE_USERS", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:lifecycle-console:CONSOLE_USERS::"},
+      {"name": "CONSOLE_SESSION_SECRET", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:lifecycle-console:CONSOLE_SESSION_SECRET::"},
+      {"name": "MLP_GITHUB_TOKEN", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:lifecycle-console:MLP_GITHUB_TOKEN::"}
+    ],
+    "healthCheck": {
+      "command": ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"],
+      "interval": 30, "timeout": 5, "retries": 3, "startPeriod": 20
+    },
+    "logConfiguration": {"logDriver": "awslogs", "options": {
+      "awslogs-group": "/ecs/lifecycle-console", "awslogs-region": "REGION",
+      "awslogs-stream-prefix": "console", "awslogs-create-group": "true"}}
+  }]
 }
 ```
 
-Set the step 3 variables on the service, then `railway up` (or connect the GitHub repo).
+```bash
+aws ecs register-task-definition --cli-input-json file://taskdef.json
+```
+
+The model catalog is baked into the image (`backend/models.json`). To change it without rebuilding,
+add `MLP_MODELS` to `environment` instead.
+
+**5. Create the load balancer.** Security groups: the ALB's (`sg-alb`) allows 443 from your users'
+networks; the task's (`sg-task`) allows 8000 from `sg-alb` only.
+
+```bash
+ALB_ARN=$(aws elbv2 create-load-balancer --name lifecycle-console --type application --scheme internet-facing \
+  --subnets subnet-public-a subnet-public-b --security-groups sg-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+TG_ARN=$(aws elbv2 create-target-group --name lifecycle-console --protocol HTTP --port 8000 --vpc-id vpc-xxxx \
+  --target-type ip --health-check-path /api/health --matcher HttpCode=200 --query 'TargetGroups[0].TargetGroupArn' --output text)
+aws elbv2 create-listener --load-balancer-arn "$ALB_ARN" --protocol HTTPS --port 443 \
+  --certificates CertificateArn=arn:aws:acm:REGION:ACCOUNT:certificate/xxxx \
+  --default-actions Type=forward,TargetGroupArn="$TG_ARN"
+```
+
+Use `--scheme internal` and private subnets instead to keep the console reachable only from your
+network or VPN.
+
+**6. Create the cluster and service.**
+
+```bash
+aws ecs create-cluster --cluster-name ml-console
+aws ecs create-service --cluster ml-console --service-name lifecycle-console \
+  --task-definition lifecycle-console --desired-count 1 --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-private-a,subnet-private-b],securityGroups=[sg-task],assignPublicIp=DISABLED}" \
+  --load-balancers "targetGroupArn=$TG_ARN,containerName=console,containerPort=8000" \
+  --health-check-grace-period-seconds 60 \
+  --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true},minimumHealthyPercent=100,maximumPercent=200"
+```
+
+Tasks in private subnets need outbound internet through a NAT gateway (GitHub API, and SageMaker, S3,
+ECR, Secrets Manager and CloudWatch unless you add VPC endpoints for them). Alternatively run them in
+public subnets with `assignPublicIp=ENABLED`, still reachable only through `sg-task`.
+
+**7. Check it.** Open `https://<ALB DNS name or your domain>`; the step 5 checks below apply. Logs are
+in CloudWatch under `/ecs/lifecycle-console`.
+
+**Release a new version:** build and push a new tag, change `image` in `taskdef.json`, register it
+again, then `aws ecs update-service --cluster ml-console --service lifecycle-console --task-definition lifecycle-console`.
+ECS starts the new task, waits for the health check, then stops the old one; the circuit breaker
+rolls back automatically if the new task never becomes healthy.
+
+Notes for ECS:
+
+- **One task is enough.** Sessions are signed cookies, so more tasks work behind the ALB, but login
+  throttling and the console's caches are per task.
+- **Cookies and client IPs:** the ALB sets `X-Forwarded-Proto: https` (so the session cookie is
+  marked Secure) and appends the caller to `X-Forwarded-For`, which login throttling reads.
+- **Approximate cost (us-east-1):** Fargate 0.25 vCPU / 0.5 GB about $9 a month, ALB about $17 a
+  month, plus a NAT gateway (about $33 a month) if the tasks run in private subnets without one
+  already.
 
 ## 5. Check it
 
@@ -226,7 +371,10 @@ Set the step 3 variables on the service, then `railway up` (or connect the GitHu
 | Approvals show no metrics, approval refused "below threshold or missing" | The package has no `ModelMetrics` S3 URI, the key cannot read it (`s3:GetObject`), or the metric names differ from `thresholds` |
 | Submitter shows "unknown"; separation of duties not enforced | The register step's description does not end with `pipeline execution <id>` |
 | "Approved, but the deploy … failed" | Usually missing `iam:PassRole` on the pipeline's execution role, or the endpoint was mid-update. The version stays approved but undeployed, and the console deploys only when a pending version is approved, so fix the cause and deploy that version with your own tooling (or approve the next version) |
-| Test endpoint: "this console has no key for it" | Set `MLP_ENDPOINT_AWS_ACCESS_KEY_ID` and `MLP_ENDPOINT_AWS_SECRET_ACCESS_KEY` |
+| Test endpoint: "no AWS credentials for the endpoint" | No task role (ECS) and no `AWS_*` or `MLP_ENDPOINT_AWS_*` keys; attach the task role or set a key |
+| ECS task stops: `ResourceInitializationError: unable to pull secrets or registry auth` | The execution role lacks `secretsmanager:GetSecretValue` on the secret, or the subnets have no route to Secrets Manager and ECR (NAT gateway or VPC endpoints) |
+| ECS task stops: `exec format error` or `CannotPullContainerError … platform` | The image was built for arm64; rebuild with `docker build --platform linux/amd64` |
+| ALB targets unhealthy | `sg-task` must allow port 8000 from `sg-alb`; the target group health check path is `/api/health` |
 | GitHub tab: "rate limit reached" or no error lines | Set `MLP_GITHUB_TOKEN` (Actions read-only) |
 | `MLP_CONSOLE_MODE=local needs the model repo's dev requirements` | The standalone image runs Real AWS mode only; use `ui/Dockerfile` in the model repo for the mocked demo |
 | A run started outside the page does not appear | Click **Refresh**; the page polls only runs it started |
