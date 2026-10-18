@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   api, ApiError, auth, Identity, login, LoginState, Package, Pipeline, Session, setUnauthorizedHandler,
 } from "./api";
+import EndpointView from "./Endpoint";
 import PipelineView from "./Pipeline";
 
 type Notice = { kind: "ok" | "error" | "warn"; text: string } | null;
@@ -100,12 +101,19 @@ function DecisionPanel({ pkg, session, onDone }: { pkg: Package; session: Sessio
     setBusy(true);
     setRefusal(null);
     try {
-      const r = await api.decide(pkg.model_package_arn, decision, pkg.canonical_hash!, comment);
+      const r = await api.decide(pkg.model_package_arn, decision, pkg.canonical_hash ?? "", comment);
+      if (session.mode === "aws") {
+        const failed = r.deploy_message?.includes("failed");
+        onDone({ kind: failed ? "warn" : "ok", text: `Version ${pkg.version} ${r.approval_status.toLowerCase()}.${r.deploy_message ? ` ${r.deploy_message}` : ""}` });
+        return;
+      }
       const capture = r.capture_action ? ` Capture: ${r.capture_action}.` : "";
       onDone({ kind: "ok", text: `Version ${pkg.version} ${r.approval_status.toLowerCase()} (approval ${short(r.approval_id, 8)}).${capture}` });
     } catch (e) {
       const err = e as ApiError;
-      const text = `Refused by the management API (${err.status}): ${err.message}`;
+      const text = session.mode === "aws"
+        ? `Refused (${err.status}): ${err.message}`
+        : `Refused by the management API (${err.status}): ${err.message}`;
       setRefusal(text);
       onDone({ kind: "error", text });
     } finally {
@@ -116,11 +124,20 @@ function DecisionPanel({ pkg, session, onDone }: { pkg: Package; session: Sessio
   return (
     <section className="card">
       <h3>Decision</h3>
-      <p className="muted small">
-        Signed in as <b>{session.mode === "local" ? session.me?.email ?? session.user : "Okta user"}</b>
-        {session.me && <> · {roleLabel(session.me)}</>}. The management API checks role, tenant scope, separation of
-        duties and the hash binding.
-      </p>
+      {session.mode === "aws" ? (
+        <p className="muted small">
+          Signed in as <b>{session.user}</b>{session.me && <> · {roleLabel(session.me)}</>}. Approving updates the SageMaker model registry
+          {session.endpoint ? <> and deploys this version to endpoint <code>{session.endpoint}</code></> : null}; rejecting
+          only updates the registry. Only a senior data scientist who did not start the run can decide, and versions
+          below the evaluation thresholds cannot be approved.
+        </p>
+      ) : (
+        <p className="muted small">
+          Signed in as <b>{session.mode === "local" ? session.me?.email ?? session.user : "Okta user"}</b>
+          {session.me && <> · {roleLabel(session.me)}</>}. The management API checks role, tenant scope, separation of
+          duties and the hash binding.
+        </p>
+      )}
       {blocked && (
         <div className="notice warn blocked">
           {blocked}
@@ -135,7 +152,7 @@ function DecisionPanel({ pkg, session, onDone }: { pkg: Package; session: Sessio
         onChange={(e) => setComment(e.target.value)} />
       <label className="check">
         <input type="checkbox" checked={reviewed} disabled={!!blocked} onChange={(e) => setReviewed(e.target.checked)} />
-        I reviewed the evidence for candidate <code>{short(pkg.canonical_hash, 16)}</code>
+        I reviewed the evidence for candidate <code>{pkg.canonical_hash ? short(pkg.canonical_hash, 16) : `v${pkg.version}`}</code>
       </label>
       <div className="actions">
         <button className="approve" disabled={!!blocked || !reviewed || busy} onClick={() => decide("approve")}>Approve</button>
@@ -285,17 +302,19 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
   const [refreshKey, setRefreshKey] = useState(0);
   const [training, setTraining] = useState(false);
   const [token, setToken] = useState(auth.token());
-  const [tab, setTab] = useState<"approvals" | "pipeline">("approvals");
+  const [tab, setTab] = useState<"approvals" | "pipeline" | "endpoint">("approvals");
   const [focusCommit, setFocusCommit] = useState<string | null>(null);
   const openPipeline = useCallback((commit?: string) => { setFocusCommit(commit ?? null); setTab("pipeline"); }, []);
   const openPackage = useCallback((arn: string) => { setSelected(arn); setTab("approvals"); }, []);
   const load = useCallback(async () => {
     try {
-      let [s, p] = await Promise.all([api.session(), api.packages()]);
+      let s = await api.session();
+      if (s.model && s.model !== auth.model()) auth.setModel(s.model);
       if (s.mode === "local" && !s.me && auth.user()) {
         auth.setUser("");
         s = await api.session();
       }
+      const p = await api.packages();
       setSession(s);
       setPackages(p);
       if (s.mode === "local" && !auth.user() && s.user) auth.setUser(s.user);
@@ -315,23 +334,35 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
     () => api.pipeline().then(setPipeline).catch((e) => setNotice({ kind: "error", text: (e as Error).message })),
     [],
   );
+  const switchModel = (id: string) => {
+    auth.setModel(id);
+    setSelected(null);
+    setPipeline(null);
+    setWatchRunId(null);
+    setTraining(false);
+    setFocusCommit(null);
+    setNotice(null);
+    refresh();
+  };
   useEffect(() => { if (tab === "pipeline" || watchRunId) loadPipeline(); }, [tab, refreshKey, watchRunId, loadPipeline]);
   useEffect(() => {
     if (!pipeline?.active_run_id && !watchRunId) return;
-    const timer = setTimeout(loadPipeline, 600);
+    // Real SageMaker runs take minutes and each poll costs ~20 API calls; the mocked runs take seconds.
+    const timer = setTimeout(loadPipeline, session?.mode === "local" ? 600 : 15000);
     return () => clearTimeout(timer);
-  }, [pipeline, watchRunId, loadPipeline]);
+  }, [pipeline, watchRunId, loadPipeline, session?.mode]);
 
   useEffect(() => {
     if (!watchRunId || !pipeline || pipeline.active_run_id === watchRunId) return;
     const run = pipeline.runs.find((r) => r.run_id === watchRunId);
     if (!run) return;
     const auc = run.metrics.auc !== undefined ? ` (auc ${run.metrics.auc.toFixed(4)})` : "";
+    const who = run.submitted_by ? `Run by ${run.submitted_by}` : "Training run";
     setNotice(run.model_package_arn
-      ? { kind: "ok", text: `Run by ${run.submitted_by} passed${auc}; v${run.model_package_arn.split("/").pop()} registered and waiting for approval.` }
+      ? { kind: "ok", text: `${who} passed${auc}; v${run.model_package_arn.split("/").pop()} registered and waiting for approval.` }
       : run.gate === "failed"
-        ? { kind: "warn", text: `Run by ${run.submitted_by} stopped at the evaluation gate${auc}; nothing registered.` }
-        : { kind: "error", text: `Run by ${run.submitted_by} did not complete (${run.status}).` });
+        ? { kind: "warn", text: `${who} stopped at the evaluation gate${auc}; nothing registered.` }
+        : { kind: "error", text: `${who} did not complete (${run.status}).` });
     setWatchRunId(null);
     setTraining(false);
     setSelected(null);
@@ -342,7 +373,7 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
     setTraining(true);
     setFocusCommit(null);
     try {
-      const r = await api.simulateTrain(shuffleLabels);
+      const r = session?.mode === "aws" ? await api.train() : await api.simulateTrain(shuffleLabels);
       setWatchRunId(r.run_id);
       setNotice(null);
       setTab("pipeline");
@@ -361,12 +392,33 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
           <span className="logo">◆</span>
           <div>
             <div className="title">Model lifecycle console</div>
-            <div className="muted small">{session.tenant_id ? `${session.tenant_id} · ` : ""}{session.group}</div>
+            {session.mode === "aws" ? (
+              <label className="model-picker small">
+                Model
+                <select value={session.model} onChange={(e) => switchModel(e.target.value)} disabled={session.models.length < 2}>
+                  {session.models.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                </select>
+                <span className="muted">{session.group}</span>
+              </label>
+            ) : (
+              <div className="muted small">{session.tenant_id ? `${session.tenant_id} · ` : ""}{session.group}</div>
+            )}
           </div>
         </div>
         <div className="topbar-right">
-          <span className={`mode ${session.mode}`}>{session.mode === "local" ? "Local · mocked AWS" : "Remote · management API"}</span>
-          {session.mode === "local" ? (
+          <span className={`mode ${session.mode}`}>
+            {{ local: "Local · mocked AWS", remote: "Remote · management API", aws: `Real AWS · ${session.region ?? ""}` }[session.mode]}
+          </span>
+          {session.mode === "aws" ? (
+            session.me && (
+              <span className="user">
+                {roleLabel(session.me)}
+                {permission(session.me) && (
+                  <span className={`pill ${permission(session.me)!.cls}`}>{permission(session.me)!.text}</span>
+                )}
+              </span>
+            )
+          ) : session.mode === "local" ? (
             <label className="user">
               Signed in as
               <select value={session.me?.email ?? session.user ?? ""}
@@ -402,9 +454,16 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
         <button className={tab === "pipeline" ? "active" : ""} onClick={() => { setFocusCommit(null); setTab("pipeline"); }}>
           Pipeline
         </button>
+        <button className={tab === "endpoint" ? "active" : ""} onClick={() => setTab("endpoint")}>
+          Test endpoint
+        </button>
       </nav>
 
-      {tab === "pipeline" ? (
+      {tab === "endpoint" ? (
+        <main className="layout single">
+          <EndpointView key={session.model} />
+        </main>
+      ) : tab === "pipeline" ? (
         <main className="layout single">
           <PipelineView session={session} pipeline={pipeline} packages={packages} focusCommit={focusCommit}
             followRunId={watchRunId} onTrain={simulateTrain} onOpenPackage={openPackage} />
@@ -427,7 +486,10 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
             </>
           )}
           {session.deploy_parameter && (
-            <div className="deploy small">Deploy signal → version {session.deploy_parameter.split("/").pop()}</div>
+            <div className="deploy small">
+              {session.mode === "aws" ? `Endpoint ${session.endpoint} → version` : "Deploy signal → version"}{" "}
+              {session.deploy_parameter.split("/").pop()}
+            </div>
           )}
           <ul>
             {packages.map((p) => (

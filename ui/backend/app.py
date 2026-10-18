@@ -6,6 +6,12 @@ MLP_CONSOLE_MODE=remote lists packages and pipeline executions from SageMaker (c
                         credentials, read-only) and forwards decisions to the private management
                         API (MLP_API_URL) with the browser's Okta bearer token. Approval rules are
                         enforced by the management API in both modes, never by this backend.
+MLP_CONSOLE_MODE=aws    single-account POC with no management API, for every model in the catalog
+                        (catalog.py; requests pick one with ?model=): packages and pipeline executions
+                        from SageMaker (AWS_* credentials); the signed-in console user approves or
+                        rejects in the registry directly, an approval deploys to the model's endpoint,
+                        and Start run starts the model's pipeline.
+In every mode the Test endpoint tab scores against a real SageMaker endpoint (see endpoint.py).
 """
 
 from __future__ import annotations
@@ -21,11 +27,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from botocore.exceptions import BotoCoreError, ClientError
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
@@ -38,9 +46,12 @@ STEP_PACE_S = float(os.environ.get("MLP_CONSOLE_STEP_PACE_S", "0.8"))
 DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import catalog  # noqa: E402
 from auth import Auth, install  # noqa: E402
+from endpoint import Endpoint, EndpointError  # noqa: E402
 
 AUTH = Auth()
+MODELS = catalog.load()
 app = FastAPI(title="ML Platform lifecycle console",
               **({"docs_url": None, "redoc_url": None, "openapi_url": None} if AUTH.enabled else {}))
 install(app, AUTH)
@@ -48,12 +59,23 @@ _lock = threading.Lock()
 _state: dict[str, Any] = {}
 
 
+@app.exception_handler(ClientError)
+def aws_error(_request: Request, exc: ClientError) -> JSONResponse:
+    err = exc.response.get("Error", {})
+    return JSONResponse({"detail": f"AWS {err.get('Code', 'error')}: {err.get('Message', str(exc))}"}, status_code=502)
+
+
+@app.exception_handler(BotoCoreError)
+def aws_client_error(_request: Request, exc: BotoCoreError) -> JSONResponse:
+    return JSONResponse({"detail": f"AWS: {exc}"}, status_code=502)
+
+
 class Decision(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     model_package_arn: str
     decision: str
-    canonical_hash: str
+    canonical_hash: str = ""
     comment: str = ""
 
 
@@ -65,6 +87,10 @@ class Arn(BaseModel):
 
 class TrainRequest(BaseModel):
     shuffle_labels: bool = False
+
+
+class ScoreRequest(BaseModel):
+    applicants: list[dict[str, Any]]
 
 
 # ----- shared helpers ----------------------------------------------------------------------
@@ -194,7 +220,7 @@ def _remote_runs(sm: Any, pipeline: str, limit: int = 10) -> list[dict[str, Any]
         arn = s["PipelineExecutionArn"]
         params = {p["Name"]: p["Value"] for p in
                   sm.list_pipeline_parameters_for_execution(PipelineExecutionArn=arn).get("PipelineParameters", [])}
-        steps = []
+        steps, registered = [], None
         for st in reversed(sm.list_pipeline_execution_steps(PipelineExecutionArn=arn).get("PipelineExecutionSteps", [])):
             start, end = st.get("StartTime"), st.get("EndTime")
             meta = st.get("Metadata") or {}
@@ -203,11 +229,13 @@ def _remote_runs(sm: Any, pipeline: str, limit: int = 10) -> list[dict[str, Any]
                           "status": st.get("StepStatus"), "started_at": str(start or ""),
                           "duration_ms": round((end - start).total_seconds() * 1000) if start and end else None,
                           "detail": st.get("FailureReason", ""), "outputs": {"outcome": outcome} if outcome else {}})
+            registered = registered or (meta.get("RegisterModel") or {}).get("Arn")
         gate = next((s_["outputs"].get("outcome") for s_ in steps if s_["type"] == "Condition"), None)
-        runs.append({"run_id": arn, "execution_arn": arn, "commit": params.get("SourceCommit"), "submitted_by": params.get("SubmittedBy"),
+        submitted_by = params.get("SubmittedBy") or _started_by(s.get("PipelineExecutionDescription"))
+        runs.append({"run_id": arn, "execution_arn": arn, "commit": params.get("SourceCommit"), "submitted_by": submitted_by,
                      "status": s.get("PipelineExecutionStatus"), "started_at": str(s.get("StartTime", "")),
                      "ended_at": None, "gate": {"True": "passed", "False": "failed"}.get(gate or ""),
-                     "parameters": params, "metrics": {}, "thresholds": {}, "steps": steps, "model_package_arn": None})
+                     "parameters": params, "metrics": {}, "thresholds": {}, "steps": steps, "model_package_arn": registered})
     return runs
 
 
@@ -345,6 +373,182 @@ def _group() -> str:
     return group
 
 
+def _pipeline_name() -> str:
+    name = os.environ.get("MLP_PIPELINE_NAME")
+    if not name:
+        from ml_platform.config import ModelConfig
+
+        name = ModelConfig.load(str(ROOT / "model.yaml")).pipeline_name
+    return name
+
+
+# ----- model catalog -----------------------------------------------------------------------
+def _model(model_id: Optional[str], fallback: bool = False) -> catalog.Model:
+    """Catalog entry for a request's ?model=; the first entry when omitted (or unknown, if fallback)."""
+    if not model_id:
+        return MODELS[0]
+    found = next((m for m in MODELS if m.id == model_id), None)
+    if found:
+        return found
+    if fallback:
+        return MODELS[0]
+    raise HTTPException(404, f"unknown model {model_id!r}")
+
+
+def _endpoint(m: catalog.Model) -> Endpoint:
+    cache = _state.setdefault("endpoints", {})
+    if m.id not in cache:
+        cache[m.id] = Endpoint(m.endpoint, m.feature_names)
+    return cache[m.id]
+
+
+def _own_package(pkg: dict[str, Any], m: catalog.Model) -> dict[str, Any]:
+    """Refuse ARNs from other groups, so a model's routes only ever touch that model's registry."""
+    if pkg.get("ModelPackageGroupName") != m.model_package_group:
+        raise HTTPException(404, f"{pkg.get('ModelPackageArn')} is not a {m.name} package")
+    return pkg
+
+
+# ----- aws mode ----------------------------------------------------------------------------
+def _region() -> str:
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+
+
+def _login(request: Request) -> str:
+    return getattr(request.state, "login", None) or "console"
+
+
+def _roles() -> dict[str, list[str]]:
+    """CONSOLE_ROLES: comma-separated user:role[+role] entries, e.g. alice:senior_data_scientist."""
+    out: dict[str, list[str]] = {}
+    for entry in filter(None, (e.strip() for e in os.environ.get("CONSOLE_ROLES", "").split(","))):
+        name, _, roles = entry.partition(":")
+        out[name.strip().lower()] = [r.strip() for r in roles.split("+") if r.strip()]
+    return out
+
+
+def _aws_identity(user: str) -> dict[str, Any]:
+    """Unlisted users are viewers when the console requires a login; open local runs act as an approver."""
+    roles = _roles().get(user.lower()) or (["viewer"] if AUTH.enabled else [APPROVER_ROLE])
+    return {"email": user, "github_login": None, "roles": roles, "tenants": ["*"], "active": True, "in_tenant": True,
+            "can_approve": APPROVER_ROLE in roles, "can_train": bool(TRAINER_ROLES & set(roles))}
+
+
+def _started_by(description: Optional[str]) -> Optional[str]:
+    match = re.search(r"lifecycle console by (\S+)$", description or "")
+    return match.group(1).lower() if match else None
+
+
+def _submitter(sm: Any, pkg: dict[str, Any], m: catalog.Model) -> Optional[str]:
+    """Console user who started the run that registered pkg, "pipeline" for other runs, None if unknown."""
+    meta = pkg.get("CustomerMetadataProperties") or {}
+    if meta.get("submitted_by"):
+        return meta["submitted_by"]
+    match = re.search(r"pipeline execution (\S+)$", pkg.get("ModelPackageDescription") or "")
+    if not match:
+        return None
+    cache = _state.setdefault("submitters", {})
+    execution = match.group(1)
+    if execution not in cache:
+        account = pkg["ModelPackageArn"].split(":")[4]
+        arn = f"arn:aws:sagemaker:{_region()}:{account}:pipeline/{m.pipeline}/execution/{execution}"
+        try:
+            description = sm.describe_pipeline_execution(PipelineExecutionArn=arn).get("PipelineExecutionDescription")
+        except ClientError:
+            return "pipeline"
+        cache[execution] = _started_by(description) or "pipeline"
+    return cache[execution]
+
+
+def _serving_package(sm: Any, m: catalog.Model) -> Optional[str]:
+    """Model package behind the model's endpoint, or None if it has no endpoint."""
+    if not m.endpoint:
+        return None
+    try:
+        config = sm.describe_endpoint(EndpointName=m.endpoint)["EndpointConfigName"]
+        model = sm.describe_endpoint_config(EndpointConfigName=config)["ProductionVariants"][0]["ModelName"]
+        desc = sm.describe_model(ModelName=model)
+    except ClientError:
+        return None
+    container = desc.get("PrimaryContainer") or (desc.get("Containers") or [{}])[0]
+    return container.get("ModelPackageName")
+
+
+def _aws_package(sm: Any, s3: Any, pkg: dict[str, Any], serving: Optional[str], m: catalog.Model) -> dict[str, Any]:
+    stats = ((pkg.get("ModelMetrics") or {}).get("ModelQuality") or {}).get("Statistics") or {}
+    candidate = {"metrics": _read_json_s3(s3, stats.get("S3Uri", "")), "thresholds": m.thresholds}
+    serving_now = serving == pkg["ModelPackageArn"]
+    summary = _summarise(pkg, candidate, "Serving on endpoint" if serving_now else None)
+    return {**summary, "model_id": m.id, "submitted_by": _submitter(sm, pkg, m), "platform_registered": True,
+            "approved_outside_api": False, "serving": serving_now}
+
+
+def _aws_history(pkg: dict[str, Any]) -> list[dict[str, Any]]:
+    meta = pkg.get("CustomerMetadataProperties") or {}
+    rows = [{"at": str(pkg.get("CreationTime", "")), "action": "REGISTERED",
+             "actor": (pkg.get("CreatedBy") or {}).get("UserProfileName") or "pipeline",
+             "comment": pkg.get("ModelPackageDescription")}]
+    if pkg.get("ModelApprovalStatus") in ("Approved", "Rejected"):
+        rows.append({"at": str(pkg.get("LastModifiedTime", "")), "action": pkg["ModelApprovalStatus"].upper(),
+                     "actor": meta.get("approved_by") or meta.get("rejected_by") or "outside the console",
+                     "comment": pkg.get("ApprovalDescription")})
+    return rows
+
+
+def _aws_deploy(sm: Any, pkg: dict[str, Any], m: catalog.Model) -> str:
+    """Point the model's endpoint at an approved package; returns a message, never raises."""
+    endpoint = m.endpoint
+    if not endpoint:
+        return f"{m.name} has no endpoint in the model catalog; nothing deployed."
+    version = pkg.get("ModelPackageVersion")
+    try:
+        role = sm.describe_pipeline(PipelineName=m.pipeline)["RoleArn"]
+        supported = (pkg.get("InferenceSpecification") or {}).get("SupportedRealtimeInferenceInstanceTypes") or []
+        instance = supported[0] if supported else "ml.t2.medium"
+        name = f"{endpoint}-v{version}-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
+        sm.create_model(ModelName=name, ExecutionRoleArn=role, Containers=[{"ModelPackageName": pkg["ModelPackageArn"]}])
+        sm.create_endpoint_config(EndpointConfigName=name, ProductionVariants=[{
+            "VariantName": "AllTraffic", "ModelName": name, "InstanceType": instance, "InitialInstanceCount": 1}])
+        try:
+            sm.describe_endpoint(EndpointName=endpoint)
+            sm.update_endpoint(EndpointName=endpoint, EndpointConfigName=name)
+            return f"Endpoint {endpoint} is switching to v{version}; the current model serves until it is ready (about 5 minutes)."
+        except ClientError as exc:
+            if "Could not find endpoint" not in str(exc):
+                raise
+            sm.create_endpoint(EndpointName=endpoint, EndpointConfigName=name)
+            return f"Creating endpoint {endpoint} with v{version} (about 5 minutes)."
+    except (ClientError, BotoCoreError) as exc:
+        return f"Approved, but the deploy to {endpoint} failed: {exc}"
+
+
+def _aws_decide(req: Decision, user: str, m: catalog.Model) -> dict[str, Any]:
+    if req.decision not in ("approve", "reject"):
+        raise HTTPException(400, "decision must be approve or reject")
+    me = _aws_identity(user)
+    if not me["can_approve"]:
+        raise HTTPException(403, f"{user} ({', '.join(me['roles'])}) cannot approve or reject; that needs a senior data scientist")
+    sm, s3 = _remote_clients()
+    pkg = _own_package(sm.describe_model_package(ModelPackageName=req.model_package_arn), m)
+    if pkg.get("ModelApprovalStatus") != "PendingManualApproval":
+        raise HTTPException(409, f"v{pkg.get('ModelPackageVersion')} is already {pkg.get('ModelApprovalStatus')}")
+    if _submitter(sm, pkg, m) == user.lower():
+        raise HTTPException(403, f"separation of duties: {user} started the run that produced "
+                                 f"v{pkg.get('ModelPackageVersion')}; another senior data scientist must decide")
+    if req.decision == "approve":
+        metrics = _aws_package(sm, s3, pkg, None, m)["metrics"]
+        failing = [name for name, minimum in m.thresholds.items() if metrics.get(name, -1) < minimum]
+        if failing:
+            raise HTTPException(409, f"cannot approve: {', '.join(failing)} below threshold or missing")
+    status = "Approved" if req.decision == "approve" else "Rejected"
+    note = f"{status} by {user} in the lifecycle console" + (f": {req.comment.strip()}" if req.comment.strip() else "")
+    sm.update_model_package(ModelPackageArn=req.model_package_arn, ModelApprovalStatus=status, ApprovalDescription=note[:1024],
+                            CustomerMetadataProperties={("approved_by" if status == "Approved" else "rejected_by"): user})
+    message = _aws_deploy(sm, pkg, m) if status == "Approved" else None
+    return {"approval_status": status, "approval_id": uuid.uuid4().hex, "deploy_message": message,
+            "deploy_parameter": _serving_package(sm, m)}
+
+
 # ----- routes ------------------------------------------------------------------------------
 @app.on_event("startup")
 def startup() -> None:
@@ -353,7 +557,19 @@ def startup() -> None:
 
 
 @app.get("/api/session")
-def session(x_console_user: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def session(request: Request, model: Optional[str] = None,
+            x_console_user: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    m = _model(model, fallback=True)
+    catalog_view = {"models": [x.public() for x in MODELS], "model": m.id}
+    if MODE == "aws":
+        user = _login(request)
+        me = _aws_identity(user)
+        identities = [_aws_identity(u) for u in sorted(AUTH.users)] or [me]
+        with _lock:
+            sm, _ = _remote_clients()
+            serving = _serving_package(sm, m)
+        return {"mode": "aws", "user": user, "me": me, "group": m.model_package_group, "identities": identities,
+                "deploy_parameter": serving, "region": _region(), "endpoint": m.endpoint, **catalog_view}
     if MODE == "local":
         lp = _local()
         identities = [_identity_view(i, lp.cfg.tenant_id) for i in lp.identities()]
@@ -362,17 +578,22 @@ def session(x_console_user: Optional[str] = Header(default=None)) -> dict[str, A
         return {"mode": "local", "user": user, "me": me, "group": lp.cfg.model_package_group,
                 "model_id": lp.cfg.model_id, "tenant_id": lp.cfg.tenant_id,
                 "identities": sorted(identities, key=lambda i: (not i["can_approve"], i["email"])),
-                "deploy_parameter": lp.deploy_parameter()}
-    return {"mode": "remote", "user": None, "me": None, "group": _group(), "identities": [], "deploy_parameter": None}
+                "deploy_parameter": lp.deploy_parameter(), **catalog_view}
+    return {"mode": "remote", "user": None, "me": None, "group": _group(), "identities": [], "deploy_parameter": None,
+            **catalog_view}
 
 
 @app.get("/api/packages")
-def packages() -> list[dict[str, Any]]:
+def packages(model: Optional[str] = None) -> list[dict[str, Any]]:
     with _lock:
         if MODE == "local":
             lp = _local()
             return [_local_package(lp, p) for p in _list_packages(lp.sm, lp.cfg.model_package_group)]
         sm, s3 = _remote_clients()
+        if MODE == "aws":
+            m = _model(model)
+            serving = _serving_package(sm, m)
+            return [_aws_package(sm, s3, p, serving, m) for p in _list_packages(sm, m.model_package_group)]
         out = []
         for pkg in _list_packages(sm, _group()):
             meta = pkg.get("CustomerMetadataProperties") or {}
@@ -381,7 +602,7 @@ def packages() -> list[dict[str, Any]]:
 
 
 @app.get("/api/package")
-def package(arn: str, authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def package(arn: str, model: Optional[str] = None, authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
     with _lock:
         if MODE == "local":
             lp = _local()
@@ -389,6 +610,10 @@ def package(arn: str, authorization: Optional[str] = Header(default=None)) -> di
             return {**_local_package(lp, pkg), "history": _local_history(lp, pkg)}
         sm, s3 = _remote_clients()
         pkg = sm.describe_model_package(ModelPackageName=arn)
+        if MODE == "aws":
+            m = _model(model)
+            _own_package(pkg, m)
+            return {**_aws_package(sm, s3, pkg, _serving_package(sm, m), m), "history": _aws_history(pkg)}
         meta = pkg.get("CustomerMetadataProperties") or {}
         summary = _summarise(pkg, _read_json_s3(s3, meta.get("evidence_uri", "")), None)
         if authorization:
@@ -399,9 +624,12 @@ def package(arn: str, authorization: Optional[str] = Header(default=None)) -> di
 
 
 @app.post("/api/decision")
-def decision(req: Decision, x_console_user: Optional[str] = Header(default=None),
+def decision(req: Decision, request: Request, model: Optional[str] = None,
+             x_console_user: Optional[str] = Header(default=None),
              authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
     with _lock:
+        if MODE == "aws":
+            return _aws_decide(req, _login(request), _model(model))
         if MODE == "local":
             lp = _local()
             result = lp.decide(_local_user(x_console_user), req.model_package_arn, req.decision,
@@ -418,7 +646,7 @@ def decision(req: Decision, x_console_user: Optional[str] = Header(default=None)
 
 
 @app.get("/api/pipeline")
-def pipeline() -> dict[str, Any]:
+def pipeline(model: Optional[str] = None) -> dict[str, Any]:
     if MODE == "local":
         # No _lock: polled while a training thread holds it; reads only the cached definition and run copies.
         lp = _local()
@@ -427,16 +655,36 @@ def pipeline() -> dict[str, Any]:
                 **_state["pipeline_view"], "runs": _snapshot(lp.runs), "active_run_id": _state["active_run"]}
     with _lock:
         sm, _ = _remote_clients()
-        name = os.environ.get("MLP_PIPELINE_NAME")
-        if not name:
-            from ml_platform.config import ModelConfig
-
-            name = ModelConfig.load(str(ROOT / "model.yaml")).pipeline_name
+        name = _model(model).pipeline if MODE == "aws" else _pipeline_name()
         runs = _remote_runs(sm, name)
         desc = sm.describe_pipeline(PipelineName=name)
         active = next((r["run_id"] for r in runs if r["status"] == "Executing"), None)
         return {"name": name, "arn": desc.get("PipelineArn"), "role_arn": desc.get("RoleArn"),
                 **_definition_view(desc["PipelineDefinition"]), "runs": runs, "active_run_id": active}
+
+
+@app.post("/api/train")
+def train(request: Request, model: Optional[str] = None) -> dict[str, Any]:
+    """Start the model's real pipeline (aws mode); follow it with GET /api/pipeline."""
+    if MODE != "aws":
+        raise HTTPException(404, "aws mode only")
+    me = _aws_identity(_login(request))
+    if not me["can_train"]:
+        raise HTTPException(403, f"{me['email']} ({', '.join(me['roles'])}) cannot start training; that needs a data scientist role")
+    m = _model(model)
+    with _lock:
+        sm, _ = _remote_clients()
+        name = m.pipeline
+        running = sm.list_pipeline_executions(PipelineName=name, SortBy="CreationTime", SortOrder="Descending",
+                                              MaxResults=5).get("PipelineExecutionSummaries", [])
+        if any(r.get("PipelineExecutionStatus") == "Executing" for r in running):
+            raise HTTPException(409, "a training run is already in progress")
+        user = re.sub(r"[^a-zA-Z0-9]+", "-", _login(request)).strip("-")[:40] or "console"
+        arn = sm.start_pipeline_execution(
+            PipelineName=name, PipelineExecutionDisplayName=f"console-{user}-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}",
+            PipelineExecutionDescription=f"Started from the lifecycle console by {_login(request)}",
+        )["PipelineExecutionArn"]
+    return {"run_id": arn}
 
 
 @app.post("/api/simulate/train")
@@ -474,6 +722,33 @@ def simulate_console_approve(req: Arn) -> dict[str, Any]:
                                    CustomerMetadataProperties=meta)
         captured = lp.capture(req.model_package_arn)
     return {"capture_action": captured["action"], "deploy_parameter": lp.deploy_parameter()}
+
+
+@app.get("/api/endpoint")
+def endpoint_status(model: Optional[str] = None) -> dict[str, Any]:
+    """Real SageMaker endpoint in every mode; local mode mocks only the lifecycle, not this."""
+    m = _model(model)
+    form = {"model": m.id, "features": m.features, "presets": m.presets, "outcome": m.outcome}
+    ep = _endpoint(m)
+    if not ep.configured:
+        return {"configured": False, "name": m.endpoint, **form}
+    try:
+        return {"configured": True, **form, **ep.status()}
+    except EndpointError as exc:
+        raise HTTPException(502, f"SageMaker: {exc}")
+
+
+@app.post("/api/endpoint/score")
+def endpoint_score(req: ScoreRequest, model: Optional[str] = None) -> dict[str, Any]:
+    ep = _endpoint(_model(model))
+    if not ep.configured:
+        raise HTTPException(404, "no endpoint configured")
+    try:
+        return ep.score(req.applicants)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except EndpointError as exc:
+        raise HTTPException(502, f"SageMaker: {exc}")
 
 
 if DIST.is_dir():

@@ -34,7 +34,7 @@ h3 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacin
 .user select { max-width: 300px; }
 .mode { font-size: 12px; padding: 4px 10px; border-radius: 999px; font-weight: 600; }
 .mode.local { background: var(--warn-bg); color: var(--warn); }
-.mode.remote { background: var(--ok-bg); color: var(--ok); }
+.mode.remote, .mode.aws { background: var(--ok-bg); color: var(--ok); }
 .user { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); }
 select, .token, textarea { font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
 .token { width: 260px; }
@@ -170,3 +170,12 @@ button.link { background: none; border: none; padding: 0; color: var(--brand); f
 .notice.inline { margin-top: 12px; }
 .notice.blocked { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
 .user .pill { margin-left: 4px; }
+
+.model-picker { display: flex; align-items: center; gap: 8px; margin-top: 2px; color: var(--muted); }
+.model-picker select { padding: 2px 6px; font-weight: 600; color: var(--text); }
+.endpoint { display: flex; flex-direction: column; gap: 16px; }
+.score-form { display: flex; flex-direction: column; gap: 10px; }
+.score-form label { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; }
+.score-form input { font: inherit; font-size: 13px; width: 140px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; }
+.prediction { display: flex; flex-direction: column; gap: 12px; }
+.verdict { font-size: 22px; }

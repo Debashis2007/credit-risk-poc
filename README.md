@@ -99,6 +99,36 @@ by the console.
   decisions are sent to the private management API with the Okta access token pasted in the
   header. The API is private, so run the console from inside the VPC or over the VPN.
 
+- **Real AWS mode** (single-account POC without the management API): `MLP_CONSOLE_MODE=aws`.
+  The **Model** picker in the header lists every model in the model catalog, and all three tabs
+  follow the selected one. Approvals lists that model's registry group with evaluation metrics from
+  each package's `ModelMetrics`, checked against the model's thresholds. A senior data scientist who
+  did not start the run approves or rejects in the SageMaker registry directly; versions below a
+  threshold cannot be approved, and an approval deploys the version to the model's endpoint (new
+  model and endpoint config from the pipeline's execution role, then an in-place endpoint update).
+  **Start run** starts the model's pipeline. Roles come from `CONSOLE_ROLES`
+  (`user:senior_data_scientist`, `user:data_scientist`; unlisted users are viewers). Uses the
+  standard `AWS_*` credentials; on the POC account the Railway key is the `credit-risk-console` IAM
+  user with the `credit-risk-console` managed policy (the credit-risk group, pipeline and endpoint
+  only, plus `iam:PassRole` on the pipeline's execution role for deploys).
+
+#### Model catalog
+
+`ui/backend/models.json` lists the models the console manages (override with `MLP_MODELS`, a JSON
+array, or `MLP_MODELS_FILE`). Each entry:
+
+| Field | Meaning |
+|-------|---------|
+| `id`, `name` | URL-safe id (`?model=`) and the name shown in the picker |
+| `model_package_group`, `pipeline`, `endpoint` | the model's SageMaker registry group, pipeline and real-time endpoint (endpoint optional) |
+| `thresholds` | `{metric: minimum}` checked before approval |
+| `features` | `[{name, label, hint, step}]` in the order the model expects; the Test endpoint form |
+| `presets`, `outcome` | example inputs for the form, and labels for the prediction (`positive`, `negative`, `score`) |
+
+To add a model: create its pipeline (registering into its group with `ModelMetrics`) and add an
+entry. The console refuses packages from other groups on a model's routes. Then extend the console's
+IAM policy to that model's group, pipeline, endpoint and evaluation bucket.
+
 Frontend development with hot reload: run the backend as above, then `cd ui/frontend && npm run dev`
 (http://127.0.0.1:5173, proxies `/api` to port 8000).
 
@@ -115,6 +145,14 @@ users. Configure each deployment with its own values, never shared with other pr
 | `CONSOLE_PROJECT` | project name, e.g. `credit-risk`; bound into the session and the cookie name |
 | `CONSOLE_SESSION_HOURS` | session lifetime, default 12 |
 | `RAILWAY_DOCKERFILE_PATH` | `ui/Dockerfile` (otherwise Railway may build the training image in the root `Dockerfile`) |
+| `MLP_ENDPOINT_REGION` | endpoint region, default `us-east-1` |
+| `MLP_ENDPOINT_AWS_ACCESS_KEY_ID` / `MLP_ENDPOINT_AWS_SECRET_ACCESS_KEY` | key for an IAM user allowed only `sagemaker:InvokeEndpoint` and `DescribeEndpoint` on the catalog's endpoints, plus `DescribeEndpointConfig` and `DescribeModel` on their configs and models |
+| `MLP_MODELS` / `MLP_MODELS_FILE` | optional model catalog override (see Model catalog) |
+| `CONSOLE_ROLES` | aws mode: `user:role` entries, comma-separated |
+
+The **Test endpoint** tab calls the selected model's real endpoint in every console mode; local mode
+mocks only the lifecycle. It uses its own `MLP_ENDPOINT_*` variables because local mode replaces
+`AWS_*` credentials with fakes.
 
 Sessions are signed with the deployment's secret and bound to its project, and the cookie is
 host-only, so a session from one project's console is never sent to, or accepted by, another.

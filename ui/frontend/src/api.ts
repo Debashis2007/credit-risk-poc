@@ -10,7 +10,7 @@ export type Identity = {
 };
 
 export type Session = {
-  mode: "local" | "remote";
+  mode: "local" | "remote" | "aws";
   user: string | null;
   me: Identity | null;
   group: string;
@@ -18,7 +18,13 @@ export type Session = {
   tenant_id?: string;
   identities: Identity[];
   deploy_parameter: string | null;
+  region?: string;
+  endpoint?: string | null;
+  models: ModelInfo[];
+  model: string;
 };
+
+export type ModelInfo = { id: string; name: string; group: string; pipeline: string; endpoint: string | null };
 
 export type HistoryEntry = { at: string; action: string; actor?: string; comment?: string | null };
 
@@ -43,6 +49,7 @@ export type Package = {
   image_uri?: string;
   lifecycle_state?: string | null;
   approved_outside_api: boolean;
+  serving?: boolean;
   history?: HistoryEntry[];
 };
 
@@ -94,6 +101,33 @@ export type Pipeline = {
   active_run_id: string | null;
 };
 
+export type Feature = { name: string; label: string; hint?: string; step?: string };
+
+export type EndpointStatus = {
+  configured: boolean;
+  model: string;
+  features: Feature[];
+  presets: Record<string, Record<string, number>>;
+  outcome: { positive: string; negative: string; score: string };
+  name?: string;
+  region?: string;
+  status?: string;
+  failure_reason?: string | null;
+  updated_at?: string | null;
+  model_name?: string;
+  instance_type?: string;
+  instance_count?: number;
+  model_package_arn?: string | null;
+  version?: number | null;
+};
+
+export type ScoreResult = {
+  endpoint: string;
+  model_version?: string;
+  latency_ms: number;
+  results: { prediction: number; score: number | null }[];
+};
+
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -102,10 +136,13 @@ export class ApiError extends Error {
 
 const USER_KEY = "mlp-console-user";
 const TOKEN_KEY = "mlp-console-okta-token";
+const MODEL_KEY = "mlp-console-model";
 
 export const auth = {
   user: () => sessionStorage.getItem(USER_KEY) ?? "",
   setUser: (email: string) => sessionStorage.setItem(USER_KEY, email),
+  model: () => sessionStorage.getItem(MODEL_KEY) ?? "",
+  setModel: (id: string) => sessionStorage.setItem(MODEL_KEY, id),
   token: () => sessionStorage.getItem(TOKEN_KEY) ?? "",
   setToken: (token: string) => sessionStorage.setItem(TOKEN_KEY, token),
 };
@@ -132,7 +169,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (auth.user()) headers["X-Console-User"] = auth.user();
   if (auth.token()) headers["Authorization"] = `Bearer ${auth.token()}`;
-  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const url = auth.model() ? `${path}${path.includes("?") ? "&" : "?"}model=${encodeURIComponent(auth.model())}` : path;
+  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && data.detail === "login required") onUnauthorized?.();
   if (!res.ok) throw new ApiError(res.status, data.detail ?? data.error ?? res.statusText);
@@ -144,11 +182,18 @@ export const api = {
   packages: () => request<Package[]>("GET", "/api/packages"),
   pkg: (arn: string) => request<Package>("GET", `/api/package?arn=${encodeURIComponent(arn)}`),
   decide: (arn: string, decision: "approve" | "reject", canonicalHash: string, comment: string) =>
-    request<{ approval_status: string; approval_id: string; capture_action?: string; deploy_parameter?: string }>(
+    request<{
+      approval_status: string; approval_id: string; capture_action?: string; deploy_parameter?: string | null;
+      deploy_message?: string | null;
+    }>(
       "POST", "/api/decision",
       { model_package_arn: arn, decision, canonical_hash: canonicalHash, comment },
     ),
   pipeline: () => request<Pipeline>("GET", "/api/pipeline"),
+  endpoint: () => request<EndpointStatus>("GET", "/api/endpoint"),
+  score: (applicants: Record<string, number>[]) =>
+    request<ScoreResult>("POST", "/api/endpoint/score", { applicants }),
+  train: () => request<{ run_id: string }>("POST", "/api/train"),
   simulateTrain: (shuffleLabels = false) =>
     request<{ run_id: string }>("POST", "/api/simulate/train", { shuffle_labels: shuffleLabels }),
   simulateConsoleApprove: (arn: string) =>

@@ -26,7 +26,7 @@ function runDuration(run: PipelineRun) {
 
 /** Where the flow stands for a run: the step executing now, or where it stopped or is waiting. */
 export function position(run: PipelineRun, order: Node[], live: boolean, pkg?: Package,
-  deployParameter?: string | null): Position {
+  deployParameter?: string | null, deployedText = "deploy signal published"): Position {
   const label = (name: string) => order.find((n) => n.name === name)?.label ?? name;
   const failed = run.steps.find((s) => s.status === "Failed");
   if (failed) return { node: failed.name, text: `Stopped: ${label(failed.name)} failed. ${failed.detail}`, tone: "stop" };
@@ -37,8 +37,9 @@ export function position(run: PipelineRun, order: Node[], live: boolean, pkg?: P
     return { node: next?.name ?? "RegisterCandidate", text: `Starting ${label(next?.name ?? "RegisterCandidate")}`, tone: "live" };
   }
   if (run.gate === "failed") {
-    const gate = run.steps.find((s) => s.name === "CheckMetric");
-    return { node: "CheckMetric", text: `Stopped at the evaluation gate. ${gate?.detail ?? ""} No candidate was published.`, tone: "stop" };
+    const gateName = order.find((n) => n.type === "Condition")?.name ?? "CheckMetric";
+    const gate = run.steps.find((s) => s.name === gateName);
+    return { node: gateName, text: `Stopped at the evaluation gate. ${gate?.detail ?? ""} No candidate was published.`, tone: "stop" };
   }
   if (run.model_package_arn && pkg) {
     if (pkg.approval_status === "PendingManualApproval")
@@ -46,10 +47,10 @@ export function position(run: PipelineRun, order: Node[], live: boolean, pkg?: P
     if (pkg.approval_status === "Rejected")
       return { node: "Registry", text: `v${pkg.version} was rejected.`, tone: "stop" };
     if (deployParameter === pkg.model_package_arn)
-      return { node: "DeploySignal", text: `v${pkg.version} approved; deploy signal published.`, tone: "done" };
+      return { node: "DeploySignal", text: `v${pkg.version} approved; ${deployedText}.`, tone: "done" };
     if (pkg.approved_outside_api)
       return { node: "Registry", text: `v${pkg.version} approved outside the API; no deploy signal.`, tone: "stop" };
-    return { node: "Registry", text: `v${pkg.version} approved; a later version holds the deploy signal.`, tone: "done" };
+    return { node: "Registry", text: `v${pkg.version} approved; another version is deployed now.`, tone: "done" };
   }
   const register = run.steps.find((s) => s.name === "RegisterCandidate");
   if (register) return { node: "RegisterCandidate", text: `Registration ${register.status.toLowerCase()}. ${register.detail}`, tone: "stop" };
@@ -130,9 +131,16 @@ export default function PipelineView({
   const live = !!run && run.run_id === pipeline.active_run_id;
   const busy = !!pipeline.active_run_id;
   const pkg = packages.find((p) => p.model_package_arn === run?.model_package_arn);
-  const order = [...CI_NODES, ...pipelineNodes, REGISTER_NODE];
-  const pos = run ? position(run, order, live, pkg, session.deploy_parameter) : undefined;
-  const allNodes = [...order, { name: "Registry", type: "Model package" }, { name: "DeploySignal", type: "SSM parameter" }];
+  const aws = session.mode === "aws";
+  const canStart = session.mode === "local" || aws;
+  const order = aws ? pipelineNodes : [...CI_NODES, ...pipelineNodes, REGISTER_NODE];
+  const deployNode = aws
+    ? { label: "Endpoint", type: session.endpoint ? `Endpoint ${session.endpoint}` : "No endpoint configured", on: "Serving", off: "Not serving" }
+    : { label: "Deploy signal", type: "SSM parameter", on: "Published", off: "Not published" };
+  const pos = run
+    ? position(run, order, live, pkg, session.deploy_parameter, aws ? `serving on ${session.endpoint}` : undefined)
+    : undefined;
+  const allNodes = [...order, { name: "Registry", type: "Model package" }, { name: "DeploySignal", type: deployNode.type, label: deployNode.label }];
   const node = allNodes.find((n) => n.name === (stepName ?? (live ? pos?.node : null))) ?? allNodes.find((n) => n.name === pos?.node) ?? allNodes[0];
   const step = run?.steps.find((s) => s.name === node.name);
   const deployed = session.deploy_parameter && session.deploy_parameter === run?.model_package_arn;
@@ -148,20 +156,25 @@ export default function PipelineView({
           <h2>Training pipeline · {pipeline.name}</h2>
           <p className="muted small">{pipeline.arn}</p>
         </div>
-        {session.mode === "local" && (
+        {canStart && (
           <div className="actions">
-            <button className="primary" disabled={busy || !session.me?.can_train} onClick={() => { setStepName(null); onTrain(false); }}>
+            <button className="primary" disabled={busy || !session.me?.can_train} onClick={() => { setStepName(null); onTrain(false); }}
+              title={aws ? "Starts a real SageMaker pipeline execution (about 11 minutes)" : undefined}>
               {busy ? "Run in progress…" : "Start run"}
             </button>
-            <button className="ghost" disabled={busy || !session.me?.can_train} onClick={() => { setStepName(null); onTrain(true); }}
-              title="Trains on shuffled labels, so the CheckMetric gate fails">
-              Start run on shuffled labels
-            </button>
+            {!aws && (
+              <button className="ghost" disabled={busy || !session.me?.can_train} onClick={() => { setStepName(null); onTrain(true); }}
+                title="Trains on shuffled labels, so the CheckMetric gate fails">
+                Start run on shuffled labels
+              </button>
+            )}
           </div>
         )}
       </header>
-      {session.mode === "local" && !session.me?.can_train && (
-        <div className="notice warn">Starting a run needs a data scientist role in tenant {session.tenant_id}.</div>
+      {canStart && !session.me?.can_train && (
+        <div className="notice warn">
+          Starting a run needs a data scientist role{aws ? "" : ` in tenant ${session.tenant_id}`}.
+        </div>
       )}
 
       {pending && <div className="where live"><NowBadge pos={{ node: "", text: "", tone: "live" }} /> Starting a new run…</div>}
@@ -171,7 +184,7 @@ export default function PipelineView({
           <div className="where-text">
             <b>Where it stands:</b> {pos.text}
             <div className="muted small">
-              Execution <code>{execId(run.execution_arn)}</code> by {run.submitted_by} · started {when(run.started_at)}
+              Execution <code>{execId(run.execution_arn)}</code>{run.submitted_by ? ` by ${run.submitted_by}` : ""} · started {when(run.started_at)}
             </div>
             {live && (
               <div className="progress"><div style={{ width: `${Math.round((done / order.length) * 100)}%` }} /></div>
@@ -183,25 +196,34 @@ export default function PipelineView({
       <section className="card">
         <h3>Flow</h3>
         <div className="lanes">
-          <div className="lane">
-            <div className="lane-title">CI</div>
-            <Flow nodes={CI_NODES} {...nodeProps} />
-          </div>
-          <span className="arrow">→</span>
+          {!aws && (
+            <>
+              <div className="lane">
+                <div className="lane-title">CI</div>
+                <Flow nodes={CI_NODES} {...nodeProps} />
+              </div>
+              <span className="arrow">→</span>
+            </>
+          )}
           <div className="lane sagemaker">
-            <div className="lane-title">SageMaker pipeline (definition from the platform)</div>
+            <div className="lane-title">{aws ? `SageMaker pipeline ${pipeline.name}` : "SageMaker pipeline (definition from the platform)"}</div>
             <Flow nodes={pipelineNodes} {...nodeProps} />
             <div className="muted small">
-              CheckMetric False → {elseSteps.length ? elseSteps.map((s) => s.name).join(", ") : "end, no candidate published"}
+              {pipeline.steps.find((s) => s.type === "Condition")?.name ?? "CheckMetric"} False →{" "}
+              {elseSteps.length ? elseSteps.map((s) => s.name).join(", ") : "end, no candidate published"}
             </div>
           </div>
           <span className="arrow">→</span>
           <div className="lane">
-            <div className="lane-title">Control plane</div>
+            <div className="lane-title">{aws ? "Registry and endpoint" : "Control plane"}</div>
             <div className="flow">
-              <StepNode node={REGISTER_NODE} step={run?.steps.find((s) => s.name === "RegisterCandidate")}
-                selected={node.name === "RegisterCandidate"} pos={pos} onSelect={() => setStepName("RegisterCandidate")} />
-              <span className="arrow">→</span>
+              {!aws && (
+                <>
+                  <StepNode node={REGISTER_NODE} step={run?.steps.find((s) => s.name === "RegisterCandidate")}
+                    selected={node.name === "RegisterCandidate"} pos={pos} onSelect={() => setStepName("RegisterCandidate")} />
+                  <span className="arrow">→</span>
+                </>
+              )}
               <button className={`node ${pkg ? (pkg.approval_status === "Approved" ? "ok" : pkg.approval_status === "Rejected" ? "skipped" : "running") : "idle"} ${pos?.node === "Registry" ? `current ${pos.tone}` : ""}`}
                 disabled={!pkg} onClick={() => pkg && onOpenPackage(pkg.model_package_arn)}
                 title={pkg ? "Open in approvals" : "No package registered"}>
@@ -213,9 +235,9 @@ export default function PipelineView({
               <span className="arrow">→</span>
               <div className={`node static ${deployed ? "ok" : "idle"} ${pos?.node === "DeploySignal" ? `current ${pos.tone}` : ""}`}>
                 {pos?.node === "DeploySignal" && <NowBadge pos={pos} />}
-                <span className="node-name">Deploy signal</span>
-                <span className="node-type">SSM parameter</span>
-                <span className="node-status">{deployed ? "Published" : "Not published"}</span>
+                <span className="node-name">{deployNode.label}</span>
+                <span className="node-type">{deployNode.type}</span>
+                <span className="node-status">{deployed ? deployNode.on : deployNode.off}</span>
               </div>
             </div>
           </div>

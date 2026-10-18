@@ -1,0 +1,26 @@
+[
+  {
+    "id": "credit-risk",
+    "name": "Credit risk",
+    "model_package_group": "ModelCreditRisk",
+    "pipeline": "credit-risk",
+    "endpoint": "credit-risk-qa",
+    "thresholds": {"auc": 0.75},
+    "features": [
+      {"name": "income", "label": "Annual income", "hint": "USD", "step": 100},
+      {"name": "debt_to_income", "label": "Debt-to-income ratio", "hint": "0 – 1.5", "step": 0.01},
+      {"name": "credit_utilization", "label": "Credit utilization", "hint": "0 – 1", "step": 0.01},
+      {"name": "late_payments_12m", "label": "Late payments (12 months)", "hint": "count", "step": 1},
+      {"name": "credit_history_years", "label": "Credit history", "hint": "years", "step": 0.5},
+      {"name": "loan_amount", "label": "Loan amount", "hint": "USD", "step": 100},
+      {"name": "open_accounts", "label": "Open accounts", "hint": "count", "step": 1}
+    ],
+    "presets": {
+      "Risky applicant": {"income": 52000, "debt_to_income": 0.62, "credit_utilization": 0.81, "late_payments_12m": 3,
+                          "credit_history_years": 2, "loan_amount": 18000, "open_accounts": 6},
+      "Safe applicant": {"income": 95000, "debt_to_income": 0.12, "credit_utilization": 0.08, "late_payments_12m": 0,
+                         "credit_history_years": 18, "loan_amount": 6000, "open_accounts": 4}
+    },
+    "outcome": {"positive": "Likely to default", "negative": "Unlikely to default", "score": "Default probability"}
+  }
+]
