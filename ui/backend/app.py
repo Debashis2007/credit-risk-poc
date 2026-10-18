@@ -295,7 +295,11 @@ def _identity_view(item: dict[str, Any], tenant_id: str) -> dict[str, Any]:
 
 
 def _start_local() -> None:
-    from moto import mock_aws
+    try:
+        from moto import mock_aws
+    except ImportError as exc:
+        raise RuntimeError("MLP_CONSOLE_MODE=local needs the model repo's dev requirements and scripts/; "
+                           "the standalone image (ui/Dockerfile.standalone) runs MLP_CONSOLE_MODE=aws only") from exc
 
     from local_e2e import (APPROVER, DATA_SCIENTIST_GITHUB, SUBMITTER_GITHUB, LocalPlatform,
                            force_fake_credentials)

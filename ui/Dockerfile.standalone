@@ -1,0 +1,26 @@
+# Lifecycle console on real AWS (MLP_CONSOLE_MODE=aws) for any model repo. Build from this ui/ folder:
+#   docker build -f Dockerfile.standalone -t lifecycle-console .
+# Models come from backend/models.json (or MLP_MODELS); see docs/lifecycle-console-standalone.md.
+FROM node:20-slim AS frontend
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-fund --no-audit
+COPY frontend/ ./
+RUN npm run build
+
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    MLP_CONSOLE_MODE=aws \
+    CONSOLE_AUTH_REQUIRED=1
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+COPY backend/ backend/
+COPY --from=frontend /app/frontend/dist frontend/dist
+RUN useradd --create-home console && chown -R console /app
+USER console
+WORKDIR /app/backend
+CMD ["sh", "-c", "exec python -m uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]

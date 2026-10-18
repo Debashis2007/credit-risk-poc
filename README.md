@@ -114,6 +114,10 @@ by the console.
 
 #### Model catalog
 
+To reuse the console for other model repos, see
+[docs/lifecycle-console-standalone.md](docs/lifecycle-console-standalone.md): copy `ui/`, edit
+`models.json`, set the environment, and build the slim `ui/Dockerfile.standalone` image.
+
 `ui/backend/models.json` lists the models the console manages (override with `MLP_MODELS`, a JSON
 array, or `MLP_MODELS_FILE`). Each entry:
 

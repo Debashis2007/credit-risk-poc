@@ -1,0 +1,4 @@
+# Lifecycle console, aws mode (Dockerfile.standalone). Local mode needs the repo-level requirements.
+fastapi>=0.104,<1
+uvicorn>=0.24,<1
+boto3>=1.34,<2
