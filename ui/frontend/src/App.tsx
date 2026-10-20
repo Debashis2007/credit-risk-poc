@@ -304,7 +304,7 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
   const [refreshKey, setRefreshKey] = useState(0);
   const [training, setTraining] = useState(false);
   const [token, setToken] = useState(auth.token());
-  const [tab, setTab] = useState<"approvals" | "pipeline" | "endpoint" | "github" | "code">("approvals");
+  const [tab, setTab] = useState<"approvals" | "pipeline" | "endpoint" | "github" | "code">("code");
   const [github, setGithub] = useState<GitHubSummary | null>(null);
   const [githubError, setGithubError] = useState<string | null>(null);
   const loadGithub = useCallback(() => {
@@ -333,6 +333,7 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
   }, []);
 
   useEffect(() => { load().then(loadGithub); }, [load, loadGithub]);
+  useEffect(() => { if (session?.mode === "remote" && tab === "code") setTab("approvals"); }, [session?.mode, tab]);
   const refresh = useCallback(() => { setRefreshKey((k) => k + 1); load().then(loadGithub); }, [load, loadGithub]);
   const pending = useMemo(() => packages.filter((p) => p.approval_status === "PendingManualApproval").length, [packages]);
 
@@ -457,6 +458,11 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
       )}
 
       <nav className="tabs">
+        {session.mode !== "remote" && (
+          <button className={tab === "code" ? "active" : ""} onClick={() => setTab("code")}>
+            Model code
+          </button>
+        )}
         <button className={tab === "approvals" ? "active" : ""} onClick={() => setTab("approvals")}>
           Approvals {pending > 0 && <span className="count">{pending}</span>}
         </button>
@@ -469,11 +475,6 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
         <button className={tab === "github" ? "active" : ""} onClick={() => { setTab("github"); loadGithub(); }}>
           GitHub {github?.alert && <span className="count bad" title="Latest run failed">!</span>}
         </button>
-        {session.mode !== "remote" && (
-          <button className={tab === "code" ? "active" : ""} onClick={() => setTab("code")}>
-            Model code
-          </button>
-        )}
       </nav>
 
       {tab === "code" ? (
