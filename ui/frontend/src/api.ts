@@ -143,6 +143,13 @@ export type GitHubSummary = {
 };
 export type GhLog = { lines: { text: string; error: boolean; gap: boolean }[]; errors: number; truncated: boolean; total_lines: number };
 
+export type CodeFile = { path: string; exists: boolean; text: string };
+export type ModelCode = {
+  configured: boolean; model: string; repo?: string; branch?: string; can_propose?: boolean; url?: string;
+  editable_config?: string[]; files?: CodeFile[];
+};
+export type Proposal = { url: string; number: number; branch: string; files: string[] };
+
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -209,6 +216,9 @@ export const api = {
   github: () => request<GitHubSummary>("GET", "/api/github"),
   githubRun: (runId: number) => request<{ run: GhRun; jobs: GhJob[] }>("GET", `/api/github/run?run_id=${runId}`),
   githubLog: (jobId: number) => request<GhLog>("GET", `/api/github/log?job_id=${jobId}`),
+  code: () => request<ModelCode>("GET", "/api/code"),
+  proposeCode: (files: Record<string, string>, title: string, description: string) =>
+    request<Proposal>("POST", "/api/code/propose", { files, title, description }),
   score: (applicants: Record<string, number>[]) =>
     request<ScoreResult>("POST", "/api/endpoint/score", { applicants }),
   train: () => request<{ run_id: string }>("POST", "/api/train"),

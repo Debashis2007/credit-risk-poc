@@ -4,6 +4,7 @@ import {
 } from "./api";
 import EndpointView from "./Endpoint";
 import GitHubView from "./GitHub";
+import ModelCodeView from "./ModelCode";
 import PipelineView from "./Pipeline";
 
 type Notice = { kind: "ok" | "error" | "warn"; text: string } | null;
@@ -303,7 +304,7 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
   const [refreshKey, setRefreshKey] = useState(0);
   const [training, setTraining] = useState(false);
   const [token, setToken] = useState(auth.token());
-  const [tab, setTab] = useState<"approvals" | "pipeline" | "endpoint" | "github">("approvals");
+  const [tab, setTab] = useState<"approvals" | "pipeline" | "endpoint" | "github" | "code">("approvals");
   const [github, setGithub] = useState<GitHubSummary | null>(null);
   const [githubError, setGithubError] = useState<string | null>(null);
   const loadGithub = useCallback(() => {
@@ -468,9 +469,18 @@ function Console({ signedIn, onSignOut }: { signedIn: string | null; onSignOut: 
         <button className={tab === "github" ? "active" : ""} onClick={() => { setTab("github"); loadGithub(); }}>
           GitHub {github?.alert && <span className="count bad" title="Latest run failed">!</span>}
         </button>
+        {session.mode !== "remote" && (
+          <button className={tab === "code" ? "active" : ""} onClick={() => setTab("code")}>
+            Model code
+          </button>
+        )}
       </nav>
 
-      {tab === "github" ? (
+      {tab === "code" ? (
+        <main className="layout single">
+          <ModelCodeView key={session.model} session={session} />
+        </main>
+      ) : tab === "github" ? (
         <main className="layout single">
           <GitHubView key={session.model} summary={github} error={githubError} onRefresh={loadGithub} />
         </main>

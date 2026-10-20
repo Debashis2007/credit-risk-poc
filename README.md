@@ -27,7 +27,7 @@ the model, its configuration, the build and deploy workflows, and the endpoint T
 | `infra/deploy-trigger/` | EventBridge rule and Lambda that start `model-deploy.yml` when a package is approved |
 | `scripts/endpoint_check.py` | Post-deploy check: served revision and test predictions |
 | `scripts/local_e2e.py` | Full lifecycle against mocked AWS |
-| `ui/` | Lifecycle console (pipeline and approvals): React frontend (`ui/frontend`), FastAPI backend (`ui/backend`) |
+| `ui/` | Lifecycle console (approvals, pipeline, endpoint, GitHub, model code): React frontend (`ui/frontend`), FastAPI backend (`ui/backend`) |
 
 ## Run locally
 
@@ -118,6 +118,25 @@ by the console.
   user with the `credit-risk-console` managed policy (the credit-risk group, pipeline and endpoint
   only).
 
+#### Model code tab
+
+Data scientists change the model from the console without touching the rest of the repository.
+The tab reads the model's editable files from its branch (`github.branch`, default `main`) and
+saving opens a pull request; nothing is committed to the branch directly, so the build
+workflow's tests and a reviewer still apply. The rules are enforced by the backend
+(`ui/backend/model_code.py`), not only by the editor:
+
+| File | Rule |
+|------|------|
+| `train.py`, `evaluate.py`, `preprocess.py`, `inference.py` | Must compile |
+| `requirements.txt` | Plain package requirements only: no `-e`/`-r`/index options, URLs or local paths |
+| `model.yaml` | Only `data.train_uri`, `data.target_column`, `steps.prepare.enabled`, `steps.train.instance` / `max_runtime` / `framework_version`, `steps.evaluate.instance`, `evaluation.metrics`, `evaluation.thresholds` (raise only), `serving.instance`, `serving.instance_count` (1–4) |
+| Anything else (workflows, `infra/`, `Dockerfile`, `ui/`, scripts, tests) | Cannot be changed from the console |
+
+Data scientists and senior data scientists can propose; viewers can only read. The pull request
+names the requester. Set `MLP_GITHUB_PR_TOKEN` to a fine-grained token with **Contents** and
+**Pull requests** read and write on the model repos; without it the tab is read-only.
+
 #### Model catalog
 
 To reuse the console for other model repos, see
@@ -160,6 +179,7 @@ users. Configure each deployment with its own values, never shared with other pr
 | `MLP_ENDPOINT_AWS_ACCESS_KEY_ID` / `MLP_ENDPOINT_AWS_SECRET_ACCESS_KEY` | key for an IAM user allowed only `sagemaker:InvokeEndpoint` and `DescribeEndpoint` on the catalog's endpoints, plus `DescribeEndpointConfig` and `DescribeModel` on their configs and models |
 | `MLP_MODELS` / `MLP_MODELS_FILE` | optional model catalog override (see Model catalog) |
 | `MLP_GITHUB_TOKEN` | optional fine-grained GitHub token, read-only **Actions** and **Metadata** on the model repos; needed for error logs in the GitHub tab (without it, public repos still list runs, at 60 GitHub API requests an hour) |
+| `MLP_GITHUB_PR_TOKEN` | optional fine-grained GitHub token, **Contents** and **Pull requests** read and write on the model repos; lets the Model code tab open pull requests |
 | `CONSOLE_ROLES` | aws mode: `user:role` entries, comma-separated |
 
 The **Test endpoint** tab calls the selected model's real endpoint in every console mode; local mode

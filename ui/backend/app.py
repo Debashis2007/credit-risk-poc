@@ -52,10 +52,13 @@ import catalog  # noqa: E402
 from auth import Auth, install  # noqa: E402
 from endpoint import Endpoint, EndpointError  # noqa: E402
 from github_ci import GitHubCI, GitHubError  # noqa: E402
+from model_code import EDITABLE_CONFIG, EDITABLE_FILES, ChangeRejected, CodeError, CodeRepo  # noqa: E402
+from model_code import validate as validate_change  # noqa: E402
 
 AUTH = Auth()
 MODELS = catalog.load()
 GITHUB = GitHubCI()
+CODE = CodeRepo()
 FAILED = {"failure", "timed_out", "startup_failure"}
 app = FastAPI(title="ML Platform lifecycle console",
               **({"docs_url": None, "redoc_url": None, "openapi_url": None} if AUTH.enabled else {}))
@@ -96,6 +99,12 @@ class TrainRequest(BaseModel):
 
 class ScoreRequest(BaseModel):
     applicants: list[dict[str, Any]]
+
+
+class CodeChange(BaseModel):
+    files: dict[str, str]
+    title: str = ""
+    description: str = ""
 
 
 # ----- shared helpers ----------------------------------------------------------------------
@@ -791,6 +800,77 @@ def github_log(job_id: int, model: Optional[str] = None) -> dict[str, Any]:
         return GITHUB.failure_log(m.github["repo"], job_id)
     except GitHubError as exc:
         raise _github_error(exc)
+
+
+def _code_requester(request: Request, x_console_user: Optional[str]) -> dict[str, Any]:
+    """Who is asking, and whether their role may change model code (the training roles)."""
+    if MODE == "aws":
+        return _aws_identity(_login(request))
+    if MODE == "local":
+        lp = _local()
+        user = _local_user(x_console_user)
+        item = next((i for i in lp.identities() if i["pk"] == user), None)
+        if not item:
+            raise HTTPException(403, f"{user} is not in the identity table")
+        return _identity_view(item, lp.cfg.tenant_id)
+    raise HTTPException(404, "the Model code tab needs the console's own sign-in (aws or local mode)")
+
+
+def _code_error(exc: CodeError) -> HTTPException:
+    if exc.status == 404:
+        return HTTPException(404, "GitHub: repository or branch not found (or not visible to the console's token)")
+    return HTTPException(409 if exc.status in (401, 403, 409, 422) else 502, f"GitHub: {exc}")
+
+
+@app.get("/api/code")
+def model_code(model: Optional[str] = None) -> dict[str, Any]:
+    """The model's editable files from its branch, and which model.yaml fields may change."""
+    m = _model(model)
+    if not m.github:
+        return {"configured": False, "model": m.id}
+    repo, branch = m.github["repo"], m.github["branch"] or "main"
+    try:
+        current = CODE.files(repo, branch)
+    except CodeError as exc:
+        raise _code_error(exc)
+    return {"configured": True, "model": m.id, "repo": repo, "branch": branch, "can_propose": CODE.can_propose,
+            "url": f"https://github.com/{repo}/tree/{branch}", "editable_config": list(EDITABLE_CONFIG),
+            "files": [{"path": p, "exists": current[p] is not None, "text": (current[p] or {}).get("text", "")}
+                      for p in EDITABLE_FILES]}
+
+
+@app.post("/api/code/propose")
+def propose_code(req: CodeChange, request: Request, model: Optional[str] = None,
+                 x_console_user: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    """Open a pull request with the edited files; the rules are checked here, never only in the browser."""
+    me = _code_requester(request, x_console_user)
+    if not me["can_train"]:
+        raise HTTPException(403, f"{me['email']} ({', '.join(me['roles'])}) cannot change model code; "
+                                 "that needs a data scientist role")
+    m = _model(model)
+    if not m.github:
+        raise HTTPException(404, f"{m.name} has no GitHub repository in the model catalog")
+    if not CODE.can_propose:
+        raise HTTPException(409, "the console has no MLP_GITHUB_PR_TOKEN, so it cannot open pull requests")
+    repo, branch = m.github["repo"], m.github["branch"] or "main"
+    outside = sorted(p for p in req.files if p not in EDITABLE_FILES)
+    if outside:
+        raise HTTPException(422, f"{', '.join(outside)} cannot be changed from the console")
+    try:
+        current = CODE.files(repo, branch)
+        changes = {p: t for p, t in req.files.items()
+                   if (current[p] or {}).get("text", "") != t and (current[p] is not None or t.strip())}
+        if not changes:
+            raise HTTPException(400, "nothing changed")
+        for path, text in changes.items():
+            validate_change(path, (current[path] or {}).get("text"), text)
+        user = me.get("github_login") or me["email"]
+        title = req.title.strip()[:200] or f"Update {', '.join(sorted(changes))} from the lifecycle console"
+        return CODE.propose(repo, branch, changes, current, user, title, req.description[:4000])
+    except ChangeRejected as exc:
+        raise HTTPException(422, str(exc))
+    except CodeError as exc:
+        raise _code_error(exc)
 
 
 if DIST.is_dir():
