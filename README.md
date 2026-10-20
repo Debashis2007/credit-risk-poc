@@ -2,8 +2,8 @@
 
 A small model repository that exercises the ML Platform v7 lifecycle end to end with a
 credit-risk classifier trained on synthetic data. The platform code (`ml_platform`, Lambdas,
-Terraform) lives in [ML-Platform](https://github.com/Debashis2007/ML-Platform); this repo only
-holds the model, its configuration and the train workflow.
+Terraform) lives in [ML-Platform](https://github.com/Debashis2007/ML-Platform); this repo holds
+the model, its configuration, the build and deploy workflows, and the endpoint Terraform.
 
 > **POC deviation:** training runs in the control plane NonProd account
 > (`aws.training_target: control_plane`). The v7 target state trains in the BU account; only the
@@ -19,7 +19,13 @@ holds the model, its configuration and the train workflow.
 | `inference.py` / `Dockerfile` | Serving image, pushed to ECR and pinned by digest |
 | `scripts/make_synthetic_data.py` | Synthetic numeric dataset with a `default` target |
 | `tests/` | Local smoke test: data, train, evaluate, threshold gate, `model.yaml` validation |
-| `.github/workflows/ml-lifecycle.yml` | Test on every PR; build image and start the pipeline on `main` |
+| `.github/workflows/ml-lifecycle.yml` | Model build: test on every PR; build image and start the pipeline on `main` |
+| `.github/workflows/model-deploy.yml` | Model deploy: staging, test on staging, manual approval, Prod (started by an approval) |
+| `.github/workflows/release-endpoint.yml` | Reusable Terraform release of one endpoint, used by `model-deploy.yml` |
+| `infra/bootstrap/` | One-time AWS setup: GitHub OIDC provider, Terraform state bucket, deploy role |
+| `infra/endpoint/` | Endpoint Terraform: model, endpoint config, blue/green endpoint, rollback alarms |
+| `infra/deploy-trigger/` | EventBridge rule and Lambda that start `model-deploy.yml` when a package is approved |
+| `scripts/endpoint_check.py` | Post-deploy check: served revision and test predictions |
 | `scripts/local_e2e.py` | Full lifecycle against mocked AWS |
 | `ui/` | Lifecycle console (pipeline and approvals): React frontend (`ui/frontend`), FastAPI backend (`ui/backend`) |
 
@@ -104,13 +110,13 @@ by the console.
   follow the selected one. Approvals lists that model's registry group with evaluation metrics from
   each package's `ModelMetrics`, checked against the model's thresholds. A senior data scientist who
   did not start the run approves or rejects in the SageMaker registry directly; versions below a
-  threshold cannot be approved, and an approval deploys the version to the model's endpoint (new
-  model and endpoint config from the pipeline's execution role, then an in-place endpoint update).
+  threshold cannot be approved. The console does not deploy: the approval's SageMaker event
+  starts the model-deploy workflow (see [Model deploy workflow](#model-deploy-workflow)).
   **Start run** starts the model's pipeline. Roles come from `CONSOLE_ROLES`
   (`user:senior_data_scientist`, `user:data_scientist`; unlisted users are viewers). Uses the
   standard `AWS_*` credentials; on the POC account the Railway key is the `credit-risk-console` IAM
   user with the `credit-risk-console` managed policy (the credit-risk group, pipeline and endpoint
-  only, plus `iam:PassRole` on the pipeline's execution role for deploys).
+  only).
 
 #### Model catalog
 
@@ -178,11 +184,65 @@ Failed logins are throttled (5 per 15 minutes per client). Without `CONSOLE_USER
 3. **Register (platform):** on pipeline success the `register_candidate` Lambda copies the model
    and evidence into the control plane with checksum verification and creates a
    `PendingManualApproval` package in `ModelCreditRisk`.
-4. **Approve (platform):** a senior data scientist other than the submitter approves through the
-   private management API (`POST /approvals`). Approvals made any other way are flagged as
-   violations and never deploy.
-5. **Promote and release (platform):** run the ML-Platform `ml-lifecycle` workflow for promotion
-   by digest, Prod retrain and approval, then the QA and LIVE blue/green releases.
+4. **Approve:** a senior data scientist other than the submitter approves the package in the
+   SageMaker Model Registry (in the POC console's aws mode, or the registry UI).
+5. **Deploy (this repo):** the approval starts `model-deploy.yml`: Terraform releases the package
+   to the staging endpoint, the staging endpoint is tested, an MLOps engineer approves the
+   `ml-prod` environment, and Terraform releases it to the Prod endpoint as a canary.
+
+The v7 target state adds promotion by digest and a Prod retrain before release; see the ML-Platform
+`ml-lifecycle` workflow. The POC deploys the same approved package to both endpoints in one account.
+
+## Model deploy workflow
+
+```
+Model Registry approval ──► EventBridge ──► deploy-trigger Lambda ──► repository_dispatch (model-approved)
+  ──► deploy-staging (Terraform) ──► test-staging ──► manual approval (ml-prod) ──► deploy-prod (Terraform)
+```
+
+| Job | What it does |
+|-----|--------------|
+| `deploy-staging` | Checks the package is `Approved` in `ModelCreditRisk`, then Terraform releases it to `credit-risk-qa`, all at once, one instance |
+| `test-staging` | `scripts/endpoint_check.py`: the endpoint is `InService`, serves exactly this package, and the presets score sensibly (Risky applicant above Safe applicant) |
+| `deploy-prod` | Waits for the `ml-prod` environment's required reviewers, then Terraform releases it to `credit-risk-prod`: two instances, 10% canary for 15 minutes, auto-rollback on 5xx or p99 latency alarms, then the same check |
+
+Each release names its model and endpoint config `<endpoint>-v<package version>`, so rerunning a
+release for the same package changes nothing. Terraform state is per environment
+(`credit-risk/endpoint-staging.tfstate`, `credit-risk/endpoint-prod.tfstate`) in
+`MLP_TF_STATE_BUCKET`, locked with S3 native locking. An endpoint created before Terraform
+managed it (the console's old direct deploy created `credit-risk-qa`) is imported on the first run.
+
+To redeploy by hand: **Actions → Model deploy → Run workflow** with the package ARN.
+
+### One-time setup
+
+0. **Bootstrap** (GitHub OIDC provider, state bucket, deploy role), applied by hand:
+   ```bash
+   cd infra/bootstrap
+   terraform init && terraform apply \
+     -var serving_role_arn="$(aws sagemaker describe-pipeline --pipeline-name credit-risk --query RoleArn --output text)"
+   # If the account already has a GitHub OIDC provider, add -var github_oidc_provider_arn=<its ARN>.
+   gh secret set MLP_GHA_DEPLOY_ROLE_ARN --env ml-staging --body "$(terraform output -raw deploy_role_arn)"
+   gh secret set MLP_GHA_DEPLOY_ROLE_ARN --env ml-prod --body "$(terraform output -raw deploy_role_arn)"
+   gh variable set MLP_TF_STATE_BUCKET --body "$(terraform output -raw state_bucket)"
+   ```
+1. **Deploy trigger** (EventBridge rule, Lambda, Secrets Manager secret), with ML-Platform checked
+   out at `.platform`:
+   ```bash
+   cd infra/deploy-trigger
+   terraform init && terraform apply
+   aws secretsmanager put-secret-value --secret-id "$(terraform output -raw github_token_secret_arn)" \
+     --secret-string '<fine-grained token: Contents read and write on credit-risk-poc>'
+   ```
+2. **GitHub environments:** `ml-staging` (no reviewers) and `ml-prod` with **Required reviewers**
+   set to the MLOps engineers. Prevent self-review so the person who approved the model in the
+   registry cannot also release it to Prod.
+3. **Deploy role** (created by the bootstrap): trusted only for
+   `repo:Debashis2007/credit-risk-poc:environment:ml-staging` and `...:environment:ml-prod`, and
+   allowed only to: describe the model's packages and pipeline; create, describe and delete its
+   models and endpoint configs; create, update, describe and invoke the two endpoints; tag them;
+   pass the serving role to SageMaker; manage the two endpoints' rollback alarms; and read and
+   write `credit-risk/*` in the state bucket.
 
 ## GitHub setup
 
@@ -195,6 +255,12 @@ Failed logins are throttled (5 per 15 minutes per client). Without `CONSOLE_USER
 | Variable | `MLP_TRAIN_ENABLED` | `true` to run the train job on pushes to `main`; leave unset until the secret and bucket above exist (tests still run on every push and PR) |
 | Variable (optional) | `MLP_PLATFORM_REF` | Platform branch or tag; defaults to `feature/v7-alignment` |
 | Variable (optional) | `MLP_MODEL_REPOSITORY_PREFIX` | ECR prefix; defaults to `ml-models` |
+| Environments | `ml-staging`, `ml-prod` | Model deploy; `ml-prod` has the MLOps engineers as required reviewers |
+| Secret (`ml-staging`, `ml-prod`) | `MLP_GHA_DEPLOY_ROLE_ARN` | OIDC deploy role (see [One-time setup](#one-time-setup)) |
+| Variable | `MLP_TF_STATE_BUCKET` | S3 bucket for the endpoint Terraform state |
+| Variable (optional) | `MLP_STAGING_ENDPOINT` / `MLP_PROD_ENDPOINT` | Endpoint names; default `credit-risk-qa` and `credit-risk-prod` |
+| Variable (optional) | `MLP_INFERENCE_ROLE_ARN` | Serving role; defaults to the pipeline's execution role |
+| Variable (optional) | `MLP_DATA_CAPTURE_S3_URI` | s3:// prefix for request and response capture; unset disables capture |
 
 The OIDC role trust policy must allow `repo:Debashis2007/credit-risk-poc:environment:ml-nonprod`.
 IAM roles are client-managed; see `docs/CLIENT_MANAGED_IAM_ROLES.md` in ML-Platform.

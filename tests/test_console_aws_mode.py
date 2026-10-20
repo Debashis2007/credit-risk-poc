@@ -1,4 +1,4 @@
-"""Console aws mode: real registry listing, approve/reject in SageMaker, deploy on approval, real pipeline runs."""
+"""Console aws mode: real registry listing, approve/reject in SageMaker, no deploy from the console, real pipeline runs."""
 
 from __future__ import annotations
 
@@ -186,37 +186,36 @@ def test_packages_come_from_registry_with_metrics_and_thresholds(aws):
     assert pkgs[4]["submitted_by"] == "pipeline"
 
 
-def test_approve_updates_registry_and_deploys_to_endpoint(aws):
+def test_approve_updates_registry_and_hands_off_to_the_deploy_workflow(aws):
     sm, client = aws()
     r = decide(client, 4, "approve", "looks good")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["approval_status"] == "Approved"
-    assert "switching to v4" in body["deploy_message"]
+    assert "model-deploy workflow now releases v4" in body["deploy_message"]
+    assert "MLOps engineer approves" in body["deploy_message"]
     update = sm.called("update_model_package")[0]
     assert update["ModelApprovalStatus"] == "Approved"
     assert update["CustomerMetadataProperties"] == {"approved_by": "console"}
     assert update["ApprovalDescription"] == "Approved by console in the lifecycle console: looks good"
-    model = sm.called("create_model")[0]
-    assert model["ExecutionRoleArn"] == ROLE
-    assert model["Containers"] == [{"ModelPackageName": pkg_arn(4)}]
-    assert model["ModelName"].startswith("credit-risk-qa-v4-")
-    assert sm.called("create_endpoint_config")[0]["ProductionVariants"][0]["InstanceType"] == "ml.t2.medium"
-    assert sm.called("update_endpoint")[0] == {"EndpointName": "credit-risk-qa", "EndpointConfigName": model["ModelName"]}
+    for call in ("create_model", "create_endpoint_config", "update_endpoint", "create_endpoint"):
+        assert not sm.called(call), f"the console must not {call}"
+    assert body["deploy_parameter"] == pkg_arn(3)
 
 
-def test_approve_creates_endpoint_when_missing(aws):
-    sm, client = aws(serving=None)
+def test_approval_note_names_the_repo_that_deploys(aws, monkeypatch):
+    _, client = aws()
+    entry = {**CATALOG[0], "github": {"repo": "Debashis2007/credit-risk-poc", "workflow": "ml-lifecycle.yml"}}
+    monkeypatch.setattr(console, "MODELS", catalog.load({"MLP_MODELS": json.dumps([entry, CATALOG[1]])}))
     body = decide(client, 4, "approve").json()
-    assert "Creating endpoint credit-risk-qa with v4" in body["deploy_message"]
-    assert sm.called("create_endpoint") and not sm.called("update_endpoint")
+    assert "model-deploy workflow in Debashis2007/credit-risk-poc now releases v4" in body["deploy_message"]
 
 
 def test_approval_below_threshold_is_refused(aws):
     sm, client = aws(aucs={3: 0.79, 4: 0.70})
     r = decide(client, 4, "approve")
     assert r.status_code == 409 and "auc below threshold" in r.json()["detail"]
-    assert not sm.called("update_model_package") and not sm.called("create_model")
+    assert not sm.called("update_model_package")
 
 
 def test_reject_updates_registry_without_deploying(aws):
@@ -224,7 +223,6 @@ def test_reject_updates_registry_without_deploying(aws):
     body = decide(client, 4, "reject", "not now").json()
     assert body["approval_status"] == "Rejected" and body["deploy_message"] is None
     assert sm.called("update_model_package")[0]["CustomerMetadataProperties"] == {"rejected_by": "console"}
-    assert not sm.called("create_model")
 
 
 def test_decided_package_cannot_be_decided_again(aws):

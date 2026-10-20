@@ -9,8 +9,10 @@ MLP_CONSOLE_MODE=remote lists packages and pipeline executions from SageMaker (c
 MLP_CONSOLE_MODE=aws    single-account POC with no management API, for every model in the catalog
                         (catalog.py; requests pick one with ?model=): packages and pipeline executions
                         from SageMaker (AWS_* credentials); the signed-in console user approves or
-                        rejects in the registry directly, an approval deploys to the model's endpoint,
-                        and Start run starts the model's pipeline.
+                        rejects in the registry directly, and Start run starts the model's pipeline.
+                        The console never deploys: an approval emits a SageMaker event, and
+                        EventBridge starts the model-deploy workflow (staging, test, manual approval,
+                        Prod with Terraform).
 In every mode the Test endpoint tab scores against a real SageMaker endpoint (see endpoint.py).
 """
 
@@ -502,31 +504,11 @@ def _aws_history(pkg: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def _aws_deploy(sm: Any, pkg: dict[str, Any], m: catalog.Model) -> str:
-    """Point the model's endpoint at an approved package; returns a message, never raises."""
-    endpoint = m.endpoint
-    if not endpoint:
-        return f"{m.name} has no endpoint in the model catalog; nothing deployed."
-    version = pkg.get("ModelPackageVersion")
-    try:
-        role = sm.describe_pipeline(PipelineName=m.pipeline)["RoleArn"]
-        supported = (pkg.get("InferenceSpecification") or {}).get("SupportedRealtimeInferenceInstanceTypes") or []
-        instance = supported[0] if supported else "ml.t2.medium"
-        name = f"{endpoint}-v{version}-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}"
-        sm.create_model(ModelName=name, ExecutionRoleArn=role, Containers=[{"ModelPackageName": pkg["ModelPackageArn"]}])
-        sm.create_endpoint_config(EndpointConfigName=name, ProductionVariants=[{
-            "VariantName": "AllTraffic", "ModelName": name, "InstanceType": instance, "InitialInstanceCount": 1}])
-        try:
-            sm.describe_endpoint(EndpointName=endpoint)
-            sm.update_endpoint(EndpointName=endpoint, EndpointConfigName=name)
-            return f"Endpoint {endpoint} is switching to v{version}; the current model serves until it is ready (about 5 minutes)."
-        except ClientError as exc:
-            if "Could not find endpoint" not in str(exc):
-                raise
-            sm.create_endpoint(EndpointName=endpoint, EndpointConfigName=name)
-            return f"Creating endpoint {endpoint} with v{version} (about 5 minutes)."
-    except (ClientError, BotoCoreError) as exc:
-        return f"Approved, but the deploy to {endpoint} failed: {exc}"
+def _deploy_note(pkg: dict[str, Any], m: catalog.Model) -> str:
+    """What happens after an approval; the console itself never deploys."""
+    where = f" in {m.github['repo']}" if m.github else ""
+    return (f"The model-deploy workflow{where} now releases v{pkg.get('ModelPackageVersion')}: staging, a test "
+            "on staging, then Prod with Terraform after an MLOps engineer approves.")
 
 
 def _aws_decide(req: Decision, user: str, m: catalog.Model) -> dict[str, Any]:
@@ -551,7 +533,7 @@ def _aws_decide(req: Decision, user: str, m: catalog.Model) -> dict[str, Any]:
     note = f"{status} by {user} in the lifecycle console" + (f": {req.comment.strip()}" if req.comment.strip() else "")
     sm.update_model_package(ModelPackageArn=req.model_package_arn, ModelApprovalStatus=status, ApprovalDescription=note[:1024],
                             CustomerMetadataProperties={("approved_by" if status == "Approved" else "rejected_by"): user})
-    message = _aws_deploy(sm, pkg, m) if status == "Approved" else None
+    message = _deploy_note(pkg, m) if status == "Approved" else None
     return {"approval_status": status, "approval_id": uuid.uuid4().hex, "deploy_message": message,
             "deploy_parameter": _serving_package(sm, m)}
 

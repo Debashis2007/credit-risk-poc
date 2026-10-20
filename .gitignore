@@ -17,3 +17,11 @@ output/
 
 # Local test run records
 tests/results/
+
+# Terraform working files (state lives in S3; the trigger zip is built on apply)
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+tfplan
+infra/**/.build/
