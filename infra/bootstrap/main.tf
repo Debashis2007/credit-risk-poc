@@ -134,7 +134,7 @@ resource "aws_iam_role_policy" "deploy" {
           "sagemaker:CreateModel", "sagemaker:DescribeModel", "sagemaker:DeleteModel",
           "sagemaker:CreateEndpointConfig", "sagemaker:DescribeEndpointConfig", "sagemaker:DeleteEndpointConfig",
           "sagemaker:CreateEndpoint", "sagemaker:UpdateEndpoint", "sagemaker:DescribeEndpoint",
-          "sagemaker:AddTags", "sagemaker:ListTags", "sagemaker:InvokeEndpoint",
+          "sagemaker:AddTags", "sagemaker:DeleteTags", "sagemaker:ListTags", "sagemaker:InvokeEndpoint",
         ]
         Resource = concat(
           local.endpoint_arns,
