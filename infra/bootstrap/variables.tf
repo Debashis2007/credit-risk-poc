@@ -13,6 +13,12 @@ variable "github_repository" {
   default = "Debashis2007/credit-risk-poc"
 }
 
+variable "github_immutable_subject_prefix" {
+  type        = string
+  default     = "repo:Debashis2007@33207849/credit-risk-poc@1403610949"
+  description = "sub_claim_prefix from GET /repos/{owner}/{repo}/actions/oidc/customization/sub."
+}
+
 variable "github_environments" {
   type        = list(string)
   default     = ["ml-staging", "ml-prod"]

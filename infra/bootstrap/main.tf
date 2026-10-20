@@ -29,11 +29,16 @@ provider "aws" {
 data "aws_caller_identity" "current" {}
 
 locals {
-  account       = data.aws_caller_identity.current.account_id
-  region        = var.aws_region
-  sm            = "arn:aws:sagemaker:${local.region}:${local.account}"
-  oidc_arn      = var.github_oidc_provider_arn != "" ? var.github_oidc_provider_arn : aws_iam_openid_connect_provider.github[0].arn
-  subjects      = [for env in var.github_environments : "repo:${var.github_repository}:environment:${env}"]
+  account  = data.aws_caller_identity.current.account_id
+  region   = var.aws_region
+  sm       = "arn:aws:sagemaker:${local.region}:${local.account}"
+  oidc_arn = var.github_oidc_provider_arn != "" ? var.github_oidc_provider_arn : aws_iam_openid_connect_provider.github[0].arn
+  # GitHub sends repo:<owner>@<id>/<repo>@<id>:environment:<env> when the repo uses immutable
+  # subject claims, and repo:<owner>/<repo>:environment:<env> otherwise; trust both.
+  subjects = flatten([for env in var.github_environments : [
+    "repo:${var.github_repository}:environment:${env}",
+    "${var.github_immutable_subject_prefix}:environment:${env}",
+  ]])
   endpoint_arns = [for e in var.endpoint_names : "${local.sm}:endpoint/${e}"]
   state_bucket  = "${var.project}-tfstate-${local.account}"
 }

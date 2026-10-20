@@ -35,8 +35,9 @@ def test_event_rule_matches_approved_packages_in_the_credit_risk_group():
 def test_deploy_role_is_assumable_only_from_the_deploy_environments():
     boot = (ROOT / "infra" / "bootstrap" / "main.tf").read_text()
     variables = (ROOT / "infra" / "bootstrap" / "variables.tf").read_text()
-    assert re.search(r'subjects\s*=\s*\[for env in var\.github_environments : '
-                     r'"repo:\$\{var\.github_repository\}:environment:\$\{env\}"\]', boot)
+    assert '"repo:${var.github_repository}:environment:${env}"' in boot
+    assert '"${var.github_immutable_subject_prefix}:environment:${env}"' in boot
+    assert re.search(r'default\s*=\s*"repo:Debashis2007@33207849/credit-risk-poc@1403610949"', variables)
     assert '"token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"' in boot
     assert re.search(r'default\s*=\s*\["ml-staging", "ml-prod"\]', variables)
     assert re.search(r'default\s*=\s*"Debashis2007/credit-risk-poc"', variables)
