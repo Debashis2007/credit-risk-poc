@@ -83,6 +83,13 @@ def test_release_verifies_the_package_then_plans_and_applies():
     assert apply["run"] == "terraform apply -input=false tfplan"
 
 
+def test_endpoint_terraform_never_replaces_a_live_endpoint_for_deployment_settings():
+    tf = (WORKFLOWS.parents[1] / "infra" / "endpoint" / "main.tf").read_text()
+    endpoint = tf[tf.index('resource "aws_sagemaker_endpoint" "this"'):tf.index('resource "aws_appautoscaling_target"')]
+    assert "ignore_changes = [deployment_config]" in endpoint
+    assert 'type                     = local.is_prod ? "CANARY" : "ALL_AT_ONCE"' in endpoint
+
+
 def test_release_state_is_separate_per_environment():
     init = next(s for s in RELEASE["jobs"]["release"]["steps"] if s.get("name") == "Terraform init")["run"]
     assert "key=credit-risk/endpoint-${{ inputs.environment }}.tfstate" in init

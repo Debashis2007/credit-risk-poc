@@ -153,6 +153,11 @@ resource "aws_sagemaker_endpoint" "this" {
   }
 
   lifecycle {
+    # The provider replaces (deletes) the endpoint when deployment_config changes, and an
+    # imported endpoint has none in state. Keep the one set at creation; to change canary
+    # settings on a live endpoint, recreate it deliberately.
+    ignore_changes = [deployment_config]
+
     precondition {
       condition     = !local.is_prod || var.instance_count >= 2
       error_message = "Prod endpoints run at least two instances."
